@@ -68,6 +68,18 @@ law and uncapped. Each agent's cycle prompt = its file slice + the ratchet
 rules (root causes only, no suppressions, verify each fix against the oracle,
 no questions, no summaries) + any queued operator message.
 
+## The two modes
+
+**FIX** (`farm fix path`, or Start with a blank instruction) has a finish
+line: grind the linter to zero, stop, report.
+
+**GRIND** (`farm run "instruction" path`, or type an instruction in the UI)
+is the og farm's soul: there is **no finish line**. Agents complete a pass,
+go again, go again, forever — fresh context every cycle, each cycle required
+to make the next concrete improvement. It ends when *you* stop it (or an
+optional `--max-cycles` budget). This is the mode that produces the
+interesting results: it never lets Claude decide it's done.
+
 ## Commands
 
 | Command | What it does |

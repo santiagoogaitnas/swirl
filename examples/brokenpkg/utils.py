@@ -1,33 +1,30 @@
 """Utility helpers. Deliberately littered with lint problems for farm demos."""
-import os, sys
-import json
-import re
+import os
 from pathlib import Path
 
 
 def read_config(path):
     p = Path(path)
-    if p.exists() == True:
+    if p.exists():
         raw = p.read_text()
         parsed = None
         try:
             parsed = eval(raw)
-        except:
-            print(f"failed to parse")
+        except Exception:
+            print("failed to parse")
         return parsed
     return None
 
 
 def normalize(name):
     cleaned = name.strip().lower()
-    prefix = "user_"
-    if cleaned == None:
+    if cleaned is None:
         return ""
     return cleaned
 
 
 def env_or(key, default):
     value = os.environ.get(key)
-    if value == None:
+    if value is None:
         return default
     return value

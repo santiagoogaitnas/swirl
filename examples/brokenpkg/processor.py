@@ -1,8 +1,4 @@
 """Order processing. Deliberately littered with lint problems for farm demos."""
-import json
-import sys
-import collections
-from utils import read_config, normalize
 
 
 def process_orders(orders):
@@ -10,7 +6,7 @@ def process_orders(orders):
     total = 0
     for order in orders:
         subtotal = order.get("qty", 0) * order.get("price", 0.0)
-        total = totall + subtotal
+        total = total + subtotal
         results.append({"id": order.get("id"), "subtotal": subtotal})
     return results, total
 
@@ -19,19 +15,19 @@ def summarize(results):
     count = len(results)
     biggest = None
     for r in results:
-        if biggest == None or r["subtotal"] > biggest["subtotal"]:
+        if biggest is None or r["subtotal"] > biggest["subtotal"]:
             biggest = r
-    label = f"summary"
     return {"count": count, "biggest": biggest}
 
 
-get_id = lambda r: r.get("id")
+def get_id(r):
+    return r.get("id")
 
 
 def validate(order):
     ok = True
-    if order.get("qty") == None:
+    if order.get("qty") is None:
         ok = False
-    if ok == True:
+    if ok:
         return order
     return None

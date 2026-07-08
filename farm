@@ -154,8 +154,21 @@ def build_prompt(agent_id: int, n_agents: int, cycle: int, slice_lines,
                  f"(cycle {cycle}) working in this repository.")
     if task:
         parts.append(f"Your standing task:\n{task}")
+        parts.append(
+            "This is a GRIND cycle: previous cycles already worked on this "
+            "task and future cycles will too. Do not conclude the task is "
+            "finished — find the next most valuable concrete improvement "
+            "and MAKE it this cycle. Real changes only.")
+        parts.append(
+            f"Collision rule: {n_agents} agents work here concurrently. "
+            f"Sort the repo's source files alphabetically; prefer files "
+            f"whose index modulo {n_agents} equals {agent_id}. If another "
+            f"agent clearly just changed a file, pick a different one.")
         parts.append(f"Verification oracle: `{oracle_cmd}` "
-                     "(stdout lines = remaining problems).")
+                     "(stdout lines = remaining problems; keep it clean).")
+        if slice_lines:
+            parts.append("Oracle problems currently open:\n"
+                         + "\n".join(f"- {ln}" for ln in slice_lines))
     else:
         listing = "\n".join(f"- {ln}" for ln in slice_lines)
         parts.append("Fix the following problems COMPLETELY this cycle "
@@ -276,7 +289,10 @@ class Runner:
     def agent_loop(self, i: int):
         adir = self.fdir / "agents" / str(i)
         cycle = 0
-        while not self.stop.is_set() and cycle < self.max_cycles:
+        # max_cycles == 0 means FOREVER — the og farm's soul: finish a pass,
+        # go again, go again, until the operator says stop.
+        while not self.stop.is_set() and \
+                (self.max_cycles == 0 or cycle < self.max_cycles):
             problems = self.oracle()
             if self.stop.is_set():
                 break
@@ -384,6 +400,14 @@ class Runner:
         self.flush_state()
         self.write_report()
 
+    def _outcome(self):
+        if self.task:
+            return ("grind ended by operator" if self.state["stopped"]
+                    else "grind ended — cycle budget reached "
+                         "(grind has no natural finish line)")
+        return ("CLEAN — oracle empty" if self.state["done"]
+                else "stopped with problems remaining")
+
     def write_report(self):
         hist = self.state["oracle_history"]
         first = hist[0]["problems"] if hist else "?"
@@ -395,7 +419,7 @@ class Runner:
                   f"- problems: {first} -> {last}\n"
                   f"- agents: {self.n} · total cycles: {cycles}\n"
                   f"- outcome: "
-                  f"{'CLEAN — oracle empty' if self.state['done'] else 'stopped with problems remaining'}\n")
+                  f"{self._outcome()}\n")
         (self.fdir / "report.md").write_text(report)
         print(report)
 
@@ -489,8 +513,11 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
 </style></head><body>
 <h1>🚜 farm <span id="chip" class="chip none">no run</span></h1>
 <div class="row">
- <input type="text" id="path" placeholder="/path/to/project — folder to fix">
+ <input type="text" id="path" placeholder="/path/to/project — folder to work on">
  <input type="text" id="nag" placeholder="agents (blank = auto max)" style="max-width:180px">
+</div>
+<div class="row">
+ <input type="text" id="task" placeholder="instruction (optional) — WITH it: agents grind forever, pass after pass, until you stop. BLANK: fix lint problems to zero.">
  <button onclick="start(false)">Start run</button>
  <button class="gray" onclick="start(true)">Demo</button>
  <button class="red" onclick="act({type:'stop'})">Stop everything</button>
@@ -504,7 +531,7 @@ let T=null;
 async function act(body){const r=await fetch('/api/action',{method:'POST',body:JSON.stringify(body)});
  const j=await r.json(); if(j.output) console.log(j.output); if(j.error) alert(j.error); tick();}
 function start(demo){act({type:'start',demo:demo,path:document.getElementById('path').value,
- agents:document.getElementById('nag').value});}
+ agents:document.getElementById('nag').value,task:document.getElementById('task').value});}
 function say(i,poke){const el=document.getElementById('in'+i); if(!el.value) return;
  act({type:poke?'poke':'say',agent:String(i),msg:el.value}); el.value='';}
 function card(i){return `<div class="card"><h3>agent ${i} <span id="st${i}" class="muted"></span></h3>
@@ -518,7 +545,9 @@ async function tick(){
  const first=hist.length?hist[0].problems:'?'; const now=st.problems_total;
  const status=st.done?['done ✅','done']:(st.stopped?['stopped','stop']:['grinding','grind']);
  chip.textContent=status[0]; chip.className='chip '+status[1];
+ const cyc=st.max_cycles===0?'∞ until you stop':(st.max_cycles+' cycles max');
  document.getElementById('summary').textContent=
+   (st.task?`∞ GRIND: "${st.task.slice(0,90)}…" · ${cyc} · `:'')+
    `${s.target} — problems ${first} → ${now} · ${st.n_agents} agents · linter: ${st.oracle||''}`;
  document.getElementById('prog').style.width=(first>0?Math.round(100*(first-now)/first):0)+'%';
  const ag=st.agents||{}; const ids=Object.keys(ag).sort((a,b)=>a-b);
@@ -563,13 +592,17 @@ def cmd_ui(args, self_path: str):
         kind = body.get("type")
         if kind == "start":
             cmd = [sys.executable, self_path]
+            task = str(body.get("task", "")).strip()
             if body.get("demo"):
                 cmd += ["demo", "--no-wall"]
             else:
                 p = Path(body.get("path", "")).expanduser()
                 if not p.is_dir():
                     return {"error": f"not a directory: {p}"}
-                cmd += ["fix", str(p), "--no-wall"]
+                if task:
+                    cmd += ["run", task, str(p), "--no-wall"]
+                else:
+                    cmd += ["fix", str(p), "--no-wall"]
             if str(body.get("agents", "")).strip():
                 cmd += ["--agents", str(body["agents"]).strip()]
             out = subprocess.run(cmd, capture_output=True, text=True,
@@ -651,17 +684,34 @@ def cmd_fix(args, self_path: str, task: str = None):
     if not problems and not task:
         print("→ oracle already clean; nothing to do")
         return
-    files = len({ln.split(":", 1)[0] for ln in problems}) or 1
+    max_cycles = args.max_cycles if args.max_cycles is not None \
+        else (0 if task else DEFAULT_MAX_CYCLES)
+    cyc = "∞ (until `farm stop`)" if max_cycles == 0 else str(max_cycles)
+    if task:
+        # grind has no finish line, so size by the whole workable surface
+        files = len([p for ext in ("*.py", "*.ts", "*.tsx", "*.js")
+                     for p in target.rglob(ext)
+                     if ".farm" not in p.parts and ".venv" not in p.parts])
+        bound = "source files"
+    else:
+        files = len({ln.split(":", 1)[0] for ln in problems})
+        bound = "files with problems (one file per agent per cycle)"
+    files = files or 1
     n = args.agents or max(1, min(FLEET_DEFAULT, files))
     why = ("set by --agents, uncapped" if args.agents
-           else f"default {FLEET_DEFAULT}, bounded only by {files} files "
-                f"with problems (one file per agent per cycle); "
+           else f"default {FLEET_DEFAULT}, bounded only by {files} {bound}; "
                 f"force any size with --agents")
     print(f"→ fleet: {n} agents ({why})")
-    print(f"→ plan: each agent loops fresh Claude sessions over its own "
-          f"slice of files, max {args.max_cycles} cycles each")
-    print("→ stops when: oracle reports 0 problems · or cycles exhausted "
-          "· or `farm stop`")
+    if task:
+        print(f"→ mode: GRIND — finish a pass, go again, go again; "
+              f"cycles: {cyc}")
+        print("→ stops when: YOU say `farm stop`"
+              + ("" if max_cycles == 0 else " · or cycle budget runs out"))
+    else:
+        print(f"→ mode: FIX — each agent works its own slice of files, "
+              f"max {cyc} cycles each")
+        print("→ stops when: oracle reports 0 problems · or cycles "
+              "exhausted · or `farm stop`")
     fdir = farm_dir(target)
     fdir.mkdir(exist_ok=True)
     # wipe per-run state, keep old reports
@@ -670,7 +720,7 @@ def cmd_fix(args, self_path: str, task: str = None):
 
     runner_cmd = [sys.executable, self_path, "_runner",
                   "--target", str(target), "--agents", str(n),
-                  "--max-cycles", str(args.max_cycles),
+                  "--max-cycles", str(max_cycles),
                   "--oracle-cmd", oracle_cmd]
     if task:
         runner_cmd += ["--task", task]
@@ -679,8 +729,7 @@ def cmd_fix(args, self_path: str, task: str = None):
     log = open(fdir / "runner.log", "a")
     proc = subprocess.Popen(runner_cmd, start_new_session=True,
                             stdout=log, stderr=log)
-    print(f"→ runner pid {proc.pid} · {n} agents · "
-          f"max {args.max_cycles} cycles/agent")
+    print(f"→ runner pid {proc.pid} · {n} agents · cycles/agent: {cyc}")
     time.sleep(1.5)          # let state.json appear before building the wall
     if not args.no_wall:
         cmd_watch(target, self_path)
@@ -697,9 +746,26 @@ def cmd_demo(args, self_path: str):
     dst = runs / f"demo-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     shutil.copytree(src, dst)
     print(f"→ demo target: {dst}")
-    ns = argparse.Namespace(path=str(dst), oracle=None, agents=args.agents,
-                            max_cycles=4, fg=False, no_wall=args.no_wall)
-    cmd_fix(ns, self_path)
+    oracle_cmd = detect_oracle(dst)
+    dirty = len(run_oracle(oracle_cmd, dst))
+    if dirty:
+        ns = argparse.Namespace(path=str(dst), oracle=None,
+                                agents=args.agents, max_cycles=4,
+                                fg=False, no_wall=args.no_wall)
+        cmd_fix(ns, self_path)
+    else:
+        # sample package is clean → show the og soul instead: agents that
+        # finish a pass and GO AGAIN (bounded so an unattended demo ends)
+        print("→ sample is lint-clean → GRIND demo: agents improve it in "
+              "endless passes (demo-capped at 6 cycles each; `farm stop` "
+              "or the UI stop button ends it sooner)")
+        ns = argparse.Namespace(path=str(dst), oracle=None,
+                                agents=args.agents, max_cycles=6,
+                                fg=False, no_wall=args.no_wall)
+        cmd_fix(ns, self_path, task=(
+            "Make this package genuinely excellent, one concrete improvement "
+            "per cycle: docstrings, type hints, input validation, error "
+            "handling, tests if none exist. Keep the linter clean."))
 
 
 def cmd_say(target: Path, agent: str, msg: str, poke: bool):
@@ -741,7 +807,8 @@ def main():
     def add_common(p):
         p.add_argument("path", nargs="?", default=".")
         p.add_argument("--agents", type=int, default=None)
-        p.add_argument("--max-cycles", type=int, default=DEFAULT_MAX_CYCLES)
+        p.add_argument("--max-cycles", type=int, default=None,
+                       help="0 = forever (grind default); fix default 10")
         p.add_argument("--oracle", default=None,
                        help="shell cmd; stdout lines = problems")
         p.add_argument("--fg", action="store_true",
