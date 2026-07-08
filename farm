@@ -34,6 +34,28 @@ DEFAULT_MAX_CYCLES = 10
 SLICE_CAP = 15          # max problems handed to one agent per cycle
 POLL_SECS = 2.0         # poke-flag / state-flush cadence
 
+def slice_for(problems, agent_id: int, n_agents: int):
+    """Partition problems by FILE (path prefix before the first ':'), then
+    deal files round-robin to agents. Two agents never share a file, so
+    concurrent edits can't collide. Falls back to stealing the tail file
+    when an agent's own files are clean but others remain."""
+    order, by_file = [], {}
+    for ln in problems:
+        f = ln.split(":", 1)[0]
+        if f not in by_file:
+            by_file[f] = []
+            order.append(f)
+        by_file[f].append(ln)
+    mine = []
+    for idx, f in enumerate(order):
+        if idx % n_agents == agent_id:
+            mine.extend(by_file[f])
+    if not mine and order:
+        steal = order[(len(order) - 1 - agent_id) % len(order)]
+        mine = by_file[steal]
+    return mine[:SLICE_CAP]
+
+
 RATCHET_RULES = """\
 Rules (non-negotiable):
 - Fix ROOT CAUSES. Never silence a problem (no `# noqa`, no ignore-comments, \
@@ -98,7 +120,7 @@ def detect_oracle(target: Path, override: str = None) -> str:
     if py:
         ruff = shutil.which("ruff")
         base = ruff if ruff else "uvx ruff"
-        return f"{base} check --output-format concise ."
+        return f"{base} check -q --output-format concise ."
     if (target / "tsconfig.json").exists():
         return "npx tsc --noEmit --pretty false"
     sys.exit("farm: could not auto-detect an oracle for this project; "
@@ -111,9 +133,11 @@ def run_oracle(oracle_cmd: str, target: Path):
     proc = subprocess.run(oracle_cmd, shell=True, cwd=str(target),
                           capture_output=True, text=True, timeout=600)
     lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
-    # ruff prints a trailing "Found N errors." summary — not a problem line
-    lines = [ln for ln in lines
-             if not ln.startswith("Found ") and not ln.startswith("[*]")]
+    # Success banners and summaries are not problems. (Learned the hard way:
+    # "All checks passed!" once counted as 1 problem and the ratchet dutifully
+    # burned every remaining cycle refusing to believe the agents.)
+    noise = ("Found ", "[*]", "All checks passed")
+    lines = [ln for ln in lines if not ln.startswith(noise)]
     return lines
 
 
@@ -255,9 +279,7 @@ class Runner:
             problems = self.oracle()
             if self.stop.is_set():
                 break
-            my_slice = problems[i::self.n][:SLICE_CAP]
-            if not my_slice and problems:
-                my_slice = problems[:min(len(problems), 5)]   # work stealing
+            my_slice = slice_for(problems, i, self.n)
             if not my_slice and not self.task:
                 break
             cycle += 1

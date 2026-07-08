@@ -92,8 +92,9 @@ State contract (everything the wall or any other UI needs):
 Built to prove the architecture end-to-end (runner + ratchet + wall + steering).
 Known simplifications, roughly in the order they'd matter:
 
-- Problem slicing is round-robin per cycle; two agents can in principle touch
-  the same file (og farm had the same issue; worktree isolation is the fix)
+- Problems are partitioned by file, so agents don't collide within a cycle —
+  except at the endgame, when a starved agent steals the tail file. Worktree
+  isolation would remove even that.
 - Oracle auto-detection covers Python (ruff) and TypeScript (tsc); everything
   else needs `--oracle`
 - No notification on completion yet (report.md + status only)
