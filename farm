@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""
+farm — headless rebuild of the Claude Code Agent Farm ("bigclaude").
+
+Design contract (the whole point of v2):
+  1. The RUNNER drives Claude Code programmatically (`claude -p --output-format
+     stream-json`). State comes from structured events, never from screen text.
+  2. The WALL is a tmux grid that only *renders* state files. Data flows
+     events -> files -> screen. The farm never reads the screen.
+  3. The RATCHET: an external oracle (linter/type-checker) decides whether work
+     continues. An agent's own "done" never terminates the loop. Every cycle is
+     a fresh session (cold context).
+
+Zero dependencies. Python 3.9+. State lives in <target>/.farm/.
+"""
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+# ---------------------------------------------------------------- constants
+
+FARM_DIRNAME = ".farm"
+DEFAULT_MAX_CYCLES = 10
+SLICE_CAP = 15          # max problems handed to one agent per cycle
+POLL_SECS = 2.0         # poke-flag / state-flush cadence
+
+RATCHET_RULES = """\
+Rules (non-negotiable):
+- Fix ROOT CAUSES. Never silence a problem (no `# noqa`, no ignore-comments, \
+no deleting code just to make a warning disappear) unless suppression is \
+genuinely the correct fix.
+- After each fix, re-run the oracle command above and confirm that specific \
+problem is gone.
+- Do not ask questions. Do not produce plans or summaries. Work.
+- If a listed problem is already fixed, verify it and move to the next.
+- When your list is done, run the oracle one final time, then stop.
+"""
+
+
+# ---------------------------------------------------------------- utilities
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def resolve_claude():
+    """Find the claude binary at runtime. Never hardcode a path."""
+    env_bin = os.environ.get("FARM_CLAUDE_BIN")
+    if env_bin and Path(env_bin).exists():
+        return env_bin
+    found = shutil.which("claude")
+    if found:
+        return found
+    for cand in (Path.home() / ".claude/local/claude",
+                 Path("/opt/homebrew/bin/claude"),
+                 Path("/usr/local/bin/claude")):
+        if cand.exists():
+            return str(cand)
+    sys.exit("farm: cannot find the `claude` binary (set FARM_CLAUDE_BIN)")
+
+
+def farm_dir(target: Path) -> Path:
+    return target / FARM_DIRNAME
+
+
+def session_name(target: Path) -> str:
+    return f"farm-{target.name.replace('.', '_').replace(' ', '_')}"
+
+
+def atomic_write_json(path: Path, obj):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, indent=1))
+    tmp.replace(path)
+
+
+def append_feed(fdir: Path, agent: int, line: str):
+    with open(fdir / "agents" / str(agent) / "feed.log", "a") as f:
+        f.write(line.rstrip("\n") + "\n")
+
+
+# ---------------------------------------------------------------- oracle
+
+def detect_oracle(target: Path, override: str = None) -> str:
+    """Return a shell command whose stdout is one problem per line."""
+    if override:
+        return override
+    py = list(target.glob("**/*.py"))[:1] or (target / "pyproject.toml").exists()
+    if py:
+        ruff = shutil.which("ruff")
+        base = ruff if ruff else "uvx ruff"
+        return f"{base} check --output-format concise ."
+    if (target / "tsconfig.json").exists():
+        return "npx tsc --noEmit --pretty false"
+    sys.exit("farm: could not auto-detect an oracle for this project; "
+             "pass one with --oracle 'cmd'")
+
+
+def run_oracle(oracle_cmd: str, target: Path):
+    """Run the oracle; return list of problem lines. Exit code is ignored on
+    purpose — the line count is the truth."""
+    proc = subprocess.run(oracle_cmd, shell=True, cwd=str(target),
+                          capture_output=True, text=True, timeout=600)
+    lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    # ruff prints a trailing "Found N errors." summary — not a problem line
+    lines = [ln for ln in lines
+             if not ln.startswith("Found ") and not ln.startswith("[*]")]
+    return lines
+
+
+# ---------------------------------------------------------------- prompts
+
+def build_prompt(agent_id: int, n_agents: int, cycle: int, slice_lines,
+                 oracle_cmd: str, operator_msg: str, task: str = None) -> str:
+    parts = []
+    if operator_msg:
+        parts.append("OPERATOR MESSAGE — HIGHEST PRIORITY, OBEY FIRST:\n"
+                     f"{operator_msg}\n")
+    parts.append(f"You are farm agent {agent_id} of {n_agents} "
+                 f"(cycle {cycle}) working in this repository.")
+    if task:
+        parts.append(f"Your standing task:\n{task}")
+        parts.append(f"Verification oracle: `{oracle_cmd}` "
+                     "(stdout lines = remaining problems).")
+    else:
+        listing = "\n".join(f"- {ln}" for ln in slice_lines)
+        parts.append("Fix the following problems COMPLETELY this cycle "
+                     f"(oracle: `{oracle_cmd}`):\n{listing}")
+    parts.append(RATCHET_RULES)
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------- renderer
+
+def render_event(ev: dict) -> str:
+    """One structured event -> one short human line for the wall."""
+    try:
+        t = ev.get("type")
+        if t == "system" and ev.get("subtype") == "init":
+            sid = str(ev.get("session_id", ""))[:8]
+            return f"── session {sid} · model {ev.get('model', '?')}"
+        if t == "assistant":
+            out = []
+            for blk in ev.get("message", {}).get("content", []):
+                bt = blk.get("type")
+                if bt == "text" and blk.get("text", "").strip():
+                    txt = " ".join(blk["text"].split())
+                    out.append("💬 " + (txt[:160] + "…" if len(txt) > 160 else txt))
+                elif bt == "tool_use":
+                    inp = blk.get("input", {})
+                    arg = (inp.get("file_path") or inp.get("command")
+                           or inp.get("pattern") or inp.get("path") or "")
+                    arg = str(arg)
+                    if len(arg) > 100:
+                        arg = arg[:100] + "…"
+                    out.append(f"⚙ {blk.get('name', '?')} {arg}")
+            return "\n".join(out)
+        if t == "user":
+            for blk in ev.get("message", {}).get("content", []):
+                if isinstance(blk, dict) and blk.get("type") == "tool_result" \
+                        and blk.get("is_error"):
+                    body = str(blk.get("content", ""))[:120]
+                    return f"✗ tool error: {body}"
+            return ""
+        if t == "result":
+            return (f"■ cycle finished · turns={ev.get('num_turns', '?')} · "
+                    f"{round(ev.get('duration_ms', 0) / 1000)}s")
+    except Exception:
+        pass
+    return ""
+
+
+# ---------------------------------------------------------------- runner
+
+class Runner:
+    """Owns the fleet. One thread per agent, each looping ratchet cycles."""
+
+    def __init__(self, target: Path, n_agents: int, max_cycles: int,
+                 oracle_cmd: str, task: str = None):
+        self.target = target
+        self.n = n_agents
+        self.max_cycles = max_cycles
+        self.oracle_cmd = oracle_cmd
+        self.task = task
+        self.fdir = farm_dir(target)
+        self.claude_bin = resolve_claude()
+        self.stop = threading.Event()
+        self.lock = threading.Lock()          # guards state + oracle
+        self.procs = {}                        # agent_id -> Popen
+        self.state = {
+            "target": str(target), "oracle": oracle_cmd, "task": task,
+            "started": now_iso(), "n_agents": n_agents,
+            "max_cycles": max_cycles, "done": False, "stopped": False,
+            "problems_total": None, "oracle_history": [],
+            "agents": {str(i): {"cycle": 0, "status": "starting",
+                                "last": "", "cycle_started": None}
+                       for i in range(n_agents)},
+        }
+
+    # ---- state helpers
+
+    def flush_state(self):
+        atomic_write_json(self.fdir / "state.json", self.state)
+
+    def set_agent(self, i, **kw):
+        with self.lock:
+            self.state["agents"][str(i)].update(kw)
+
+    # ---- oracle wrapper (serialized, records history)
+
+    def oracle(self):
+        with self.lock:
+            problems = run_oracle(self.oracle_cmd, self.target)
+            self.state["problems_total"] = len(problems)
+            self.state["oracle_history"].append(
+                {"t": now_iso(), "problems": len(problems)})
+            with open(self.fdir / "oracle.log", "a") as f:
+                f.write(f"{now_iso()} problems={len(problems)}\n")
+            if not problems and not self.task:
+                self.state["done"] = True
+                self.stop.set()
+            return problems
+
+    # ---- operator messaging
+
+    def take_inbox(self, i) -> str:
+        p = self.fdir / "inbox" / f"{i}.txt"
+        if p.exists():
+            msg = p.read_text().strip()
+            p.unlink(missing_ok=True)
+            return msg
+        return ""
+
+    def poke_requested(self, i) -> bool:
+        return (self.fdir / "poke" / str(i)).exists()
+
+    def clear_poke(self, i):
+        (self.fdir / "poke" / str(i)).unlink(missing_ok=True)
+
+    # ---- one agent's ratchet loop
+
+    def agent_loop(self, i: int):
+        adir = self.fdir / "agents" / str(i)
+        cycle = 0
+        while not self.stop.is_set() and cycle < self.max_cycles:
+            problems = self.oracle()
+            if self.stop.is_set():
+                break
+            my_slice = problems[i::self.n][:SLICE_CAP]
+            if not my_slice and problems:
+                my_slice = problems[:min(len(problems), 5)]   # work stealing
+            if not my_slice and not self.task:
+                break
+            cycle += 1
+            msg = self.take_inbox(i)
+            prompt = build_prompt(i, self.n, cycle, my_slice,
+                                  self.oracle_cmd, msg, self.task)
+            self.set_agent(i, cycle=cycle, status="working",
+                           cycle_started=now_iso(),
+                           last=f"cycle {cycle}: {len(my_slice)} problems")
+            append_feed(self.fdir, i,
+                        f"\n━━━ CYCLE {cycle} · {len(my_slice)} problems "
+                        f"assigned · {now_iso()} ━━━")
+            if msg:
+                append_feed(self.fdir, i, f"✉ operator: {msg}")
+            self.run_cycle(i, cycle, prompt, adir)
+        self.set_agent(i, status="done" if not self.stop.is_set()
+                       or self.state.get("done") else "stopped")
+        append_feed(self.fdir, i, "━━━ agent finished ━━━")
+
+    def run_cycle(self, i: int, cycle: int, prompt: str, adir: Path):
+        raw = open(adir / f"cycle-{cycle}.jsonl", "w")
+        cmd = [self.claude_bin, "-p", prompt,
+               "--output-format", "stream-json", "--verbose",
+               "--dangerously-skip-permissions"]
+        proc = subprocess.Popen(cmd, cwd=str(self.target),
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        self.procs[i] = proc
+        try:
+            for line in proc.stdout:
+                raw.write(line)
+                raw.flush()
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                rendered = render_event(ev)
+                if rendered:
+                    append_feed(self.fdir, i, rendered)
+                    self.set_agent(i, last=rendered.splitlines()[-1][:120])
+        finally:
+            proc.wait()
+            raw.close()
+            self.procs.pop(i, None)
+
+    # ---- poke watcher: interrupt = end cycle now (fresh cycle picks up msg)
+
+    def watcher(self):
+        while not self.stop.is_set():
+            for i in range(self.n):
+                if self.poke_requested(i):
+                    self.clear_poke(i)
+                    proc = self.procs.get(i)
+                    if proc and proc.poll() is None:
+                        append_feed(self.fdir, i,
+                                    "⚡ poked — restarting cycle now")
+                        proc.terminate()
+            with self.lock:
+                pass
+            self.flush_state()
+            time.sleep(POLL_SECS)
+        self.flush_state()
+
+    # ---- entry
+
+    def run(self):
+        for sub in ("agents", "inbox", "poke"):
+            (self.fdir / sub).mkdir(parents=True, exist_ok=True)
+        for i in range(self.n):
+            (self.fdir / "agents" / str(i)).mkdir(exist_ok=True)
+            append_feed(self.fdir, i,
+                        f"agent {i} ready · target {self.target}")
+        (self.fdir / "farm.pid").write_text(str(os.getpid()))
+        self.flush_state()
+
+        def on_term(sig, frame):
+            self.state["stopped"] = True
+            self.stop.set()
+            for p in list(self.procs.values()):
+                if p.poll() is None:
+                    p.terminate()
+        signal.signal(signal.SIGTERM, on_term)
+        signal.signal(signal.SIGINT, on_term)
+
+        threads = [threading.Thread(target=self.agent_loop, args=(i,),
+                                    daemon=True) for i in range(self.n)]
+        wt = threading.Thread(target=self.watcher, daemon=True)
+        wt.start()
+        for t in threads:
+            t.start()
+        for t in threads:
+            while t.is_alive():
+                t.join(timeout=1.0)
+        self.stop.set()
+        wt.join(timeout=POLL_SECS + 1)
+        final = self.oracle() if not self.state["stopped"] else None
+        with self.lock:
+            self.state["done"] = (final is not None and not final) \
+                or self.state["done"]
+            self.state["finished"] = now_iso()
+        self.flush_state()
+        self.write_report()
+
+    def write_report(self):
+        hist = self.state["oracle_history"]
+        first = hist[0]["problems"] if hist else "?"
+        last = hist[-1]["problems"] if hist else "?"
+        cycles = sum(a["cycle"] for a in self.state["agents"].values())
+        report = (f"# farm report · {now_iso()}\n\n"
+                  f"- target: {self.target}\n"
+                  f"- oracle: `{self.oracle_cmd}`\n"
+                  f"- problems: {first} -> {last}\n"
+                  f"- agents: {self.n} · total cycles: {cycles}\n"
+                  f"- outcome: "
+                  f"{'CLEAN — oracle empty' if self.state['done'] else 'stopped with problems remaining'}\n")
+        (self.fdir / "report.md").write_text(report)
+        print(report)
+
+
+# ---------------------------------------------------------------- wall
+
+def cmd_watch(target: Path, self_path: str):
+    """Build the tmux wall: pane 0 = fleet status, one pane per agent feed.
+    tmux is write-only: we create panes and run tail/status in them. The farm
+    never reads the screen."""
+    if not shutil.which("tmux"):
+        sys.exit("farm watch: tmux not found")
+    fdir = farm_dir(target)
+    state = json.loads((fdir / "state.json").read_text())
+    sess = session_name(target)
+    subprocess.run(["tmux", "kill-session", "-t", sess],
+                   capture_output=True)
+    subprocess.run(["tmux", "new-session", "-d", "-s", sess,
+                    "-x", "220", "-y", "50",
+                    f"exec {shlex.quote(self_path)} status --live "
+                    f"--target {shlex.quote(str(target))}"], check=True)
+    for i in range(state["n_agents"]):
+        feed = fdir / "agents" / str(i) / "feed.log"
+        subprocess.run(["tmux", "split-window", "-t", sess,
+                        f"exec tail -n 40 -f {shlex.quote(str(feed))}"],
+                       check=True)
+        subprocess.run(["tmux", "select-layout", "-t", sess, "tiled"],
+                       check=True)
+    print(f"wall ready → tmux attach -t {sess}")
+
+
+def cmd_status(target: Path, live: bool):
+    fdir = farm_dir(target)
+    spath = fdir / "state.json"
+
+    def render():
+        try:
+            s = json.loads(spath.read_text())
+        except Exception:
+            return "no farm state yet"
+        out = []
+        prob = s.get("problems_total")
+        hist = s.get("oracle_history", [])
+        first = hist[0]["problems"] if hist else "?"
+        flag = ("✅ DONE — oracle clean" if s.get("done")
+                else ("⛔ stopped" if s.get("stopped") else "🜄 grinding"))
+        out.append(f"FARM {s.get('target', '')}")
+        out.append(f"{flag} · problems {first} → {prob} · "
+                   f"oracle `{s.get('oracle', '')}`")
+        out.append("")
+        out.append(f"{'ag':>3} {'cycle':>5}  {'status':<9} last")
+        for i, a in sorted(s.get("agents", {}).items(), key=lambda kv: int(kv[0])):
+            out.append(f"{i:>3} {a.get('cycle', 0):>5}  "
+                       f"{a.get('status', '?'):<9} {a.get('last', '')[:110]}")
+        out.append("")
+        out.append("steer:  farm say <n> \"msg\"   ·   farm poke <n> \"msg\""
+                   "   ·   farm stop")
+        return "\n".join(out)
+
+    if not live:
+        print(render())
+        return
+    try:
+        while True:
+            sys.stdout.write("\x1b[2J\x1b[H" + render() + "\n")
+            sys.stdout.flush()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_fix(args, self_path: str, task: str = None):
+    target = Path(args.path).resolve()
+    if not target.is_dir():
+        sys.exit(f"farm: no such directory {target}")
+    oracle_cmd = detect_oracle(target, args.oracle)
+    problems = run_oracle(oracle_cmd, target)
+    print(f"→ oracle: `{oracle_cmd}` → {len(problems)} problems")
+    if not problems and not task:
+        print("→ oracle already clean; nothing to do")
+        return
+    n = args.agents or min(8, max(2, len(problems) // 12 or 2))
+    fdir = farm_dir(target)
+    fdir.mkdir(exist_ok=True)
+    # wipe per-run state, keep old reports
+    for sub in ("agents", "inbox", "poke"):
+        shutil.rmtree(fdir / sub, ignore_errors=True)
+
+    runner_cmd = [sys.executable, self_path, "_runner",
+                  "--target", str(target), "--agents", str(n),
+                  "--max-cycles", str(args.max_cycles),
+                  "--oracle-cmd", oracle_cmd]
+    if task:
+        runner_cmd += ["--task", task]
+    if args.fg:
+        os.execv(sys.executable, runner_cmd)
+    log = open(fdir / "runner.log", "a")
+    proc = subprocess.Popen(runner_cmd, start_new_session=True,
+                            stdout=log, stderr=log)
+    print(f"→ runner pid {proc.pid} · {n} agents · "
+          f"max {args.max_cycles} cycles/agent")
+    time.sleep(1.5)          # let state.json appear before building the wall
+    if not args.no_wall:
+        cmd_watch(target, self_path)
+    print(f"→ logs: {fdir}/  ·  report lands at {fdir}/report.md")
+
+
+def cmd_demo(args, self_path: str):
+    root = Path(self_path).resolve().parent
+    src = root / "examples" / "brokenpkg"
+    runs = root / "runs"
+    runs.mkdir(exist_ok=True)
+    dst = runs / f"demo-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    shutil.copytree(src, dst)
+    print(f"→ demo target: {dst}")
+    ns = argparse.Namespace(path=str(dst), oracle=None, agents=args.agents,
+                            max_cycles=4, fg=False, no_wall=args.no_wall)
+    cmd_fix(ns, self_path)
+
+
+def cmd_say(target: Path, agent: str, msg: str, poke: bool):
+    fdir = farm_dir(target)
+    n = json.loads((fdir / "state.json").read_text())["n_agents"]
+    ids = range(n) if agent == "all" else [int(agent)]
+    for i in ids:
+        (fdir / "inbox").mkdir(exist_ok=True)
+        (fdir / "inbox" / f"{i}.txt").write_text(msg)
+        if poke:
+            (fdir / "poke").mkdir(exist_ok=True)
+            (fdir / "poke" / str(i)).write_text("1")
+    verb = "poked" if poke else "queued for next cycle"
+    print(f"✉ {verb}: agent {agent}")
+
+
+def cmd_stop(target: Path):
+    fdir = farm_dir(target)
+    pid_file = fdir / "farm.pid"
+    if pid_file.exists():
+        pid = int(pid_file.read_text())
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            print(f"→ sent SIGTERM to runner group {pid}")
+        except ProcessLookupError:
+            print("→ runner not running")
+    subprocess.run(["tmux", "kill-session", "-t", session_name(target)],
+                   capture_output=True)
+    print("→ wall closed")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    self_path = os.path.realpath(__file__)
+    ap = argparse.ArgumentParser(prog="farm", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add_common(p):
+        p.add_argument("path", nargs="?", default=".")
+        p.add_argument("--agents", type=int, default=None)
+        p.add_argument("--max-cycles", type=int, default=DEFAULT_MAX_CYCLES)
+        p.add_argument("--oracle", default=None,
+                       help="shell cmd; stdout lines = problems")
+        p.add_argument("--fg", action="store_true",
+                       help="run the runner in the foreground")
+        p.add_argument("--no-wall", action="store_true")
+
+    add_common(sub.add_parser("fix", help="ratchet the oracle to zero"))
+    p_run = sub.add_parser("run", help="free-form task with oracle backstop")
+    p_run.add_argument("task")
+    add_common(p_run)
+
+    p_demo = sub.add_parser("demo", help="self-contained demo on a broken pkg")
+    p_demo.add_argument("--agents", type=int, default=2)
+    p_demo.add_argument("--no-wall", action="store_true")
+
+    for name in ("status", "watch", "stop"):
+        p = sub.add_parser(name)
+        p.add_argument("--target", default=".")
+        if name == "status":
+            p.add_argument("--live", action="store_true")
+
+    for name in ("say", "poke"):
+        p = sub.add_parser(name, help="message an agent (poke = interrupt now)")
+        p.add_argument("agent", help="agent number or 'all'")
+        p.add_argument("message")
+        p.add_argument("--target", default=".")
+
+    pr = sub.add_parser("_runner")
+    pr.add_argument("--target", required=True)
+    pr.add_argument("--agents", type=int, required=True)
+    pr.add_argument("--max-cycles", type=int, required=True)
+    pr.add_argument("--oracle-cmd", required=True)
+    pr.add_argument("--task", default=None)
+
+    args = ap.parse_args()
+    if args.cmd == "fix":
+        cmd_fix(args, self_path)
+    elif args.cmd == "run":
+        cmd_fix(args, self_path, task=args.task)
+    elif args.cmd == "demo":
+        cmd_demo(args, self_path)
+    elif args.cmd == "watch":
+        cmd_watch(Path(args.target).resolve(), self_path)
+    elif args.cmd == "status":
+        cmd_status(Path(args.target).resolve(), args.live)
+    elif args.cmd == "stop":
+        cmd_stop(Path(args.target).resolve())
+    elif args.cmd in ("say", "poke"):
+        cmd_say(Path(args.target).resolve(), args.agent, args.message,
+                poke=(args.cmd == "poke"))
+    elif args.cmd == "_runner":
+        Runner(Path(args.target), args.agents, args.max_cycles,
+               args.oracle_cmd, task=args.task).run()
+
+
+if __name__ == "__main__":
+    main()
