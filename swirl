@@ -660,8 +660,16 @@ def cmd_ui(args, self_path: str):
             except Exception as e:
                 return self._json({"error": str(e)}, 500)
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"
+    try:
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", args.port),
+                                              Handler)
+    except OSError:
+        # already running — just bring the page back
+        print(f"swirl is already up → {url}")
+        if not args.no_open and sys.platform == "darwin":
+            subprocess.run(["open", url], capture_output=True)
+        return
     print(f"swirl ui → {url}   (Ctrl-C to quit; runs keep going without it)")
     if not args.no_open and sys.platform == "darwin":
         subprocess.run(["open", url], capture_output=True)
@@ -774,6 +782,8 @@ def cmd_stop(target: Path):
 
 def main():
     self_path = os.path.realpath(__file__)
+    if len(sys.argv) == 1:
+        sys.argv.append("ui")      # bare `swirl` = open the page
     ap = argparse.ArgumentParser(prog="swirl", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
