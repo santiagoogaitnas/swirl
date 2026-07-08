@@ -467,6 +467,178 @@ def cmd_status(target: Path, live: bool):
         pass
 
 
+# ---------------------------------------------------------------- web ui
+
+UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<title>farm</title><style>
+ body{background:#111;color:#ddd;font:14px -apple-system,sans-serif;margin:0;padding:20px}
+ h1{font-size:18px;margin:0 0 12px} .muted{color:#888} .mono{font-family:ui-monospace,monospace}
+ .bar{background:#222;border-radius:6px;height:14px;overflow:hidden;margin:8px 0}
+ .bar div{background:#4a9;height:100%;transition:width .5s}
+ .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
+ input[type=text]{background:#1a1a1a;border:1px solid #333;color:#ddd;padding:7px;border-radius:6px;flex:1;min-width:120px}
+ button{background:#2a4;border:0;color:#fff;padding:8px 14px;border-radius:6px;cursor:pointer}
+ button.gray{background:#444} button.red{background:#a33} button.amber{background:#a80}
+ .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(430px,1fr));gap:12px;margin-top:14px}
+ .card{background:#191919;border:1px solid #2a2a2a;border-radius:8px;padding:12px}
+ .card h3{margin:0 0 6px;font-size:14px}
+ pre{background:#0c0c0c;border-radius:6px;padding:8px;height:190px;overflow-y:auto;font-size:11px;white-space:pre-wrap;margin:8px 0}
+ .chip{padding:2px 10px;border-radius:10px;font-size:12px}
+ .grind{background:#a80} .done{background:#2a4} .stop{background:#a33} .none{background:#444}
+ #report{background:#152015;border:1px solid #2a4;border-radius:8px;padding:12px;margin-top:14px;white-space:pre-wrap;display:none}
+</style></head><body>
+<h1>🚜 farm <span id="chip" class="chip none">no run</span></h1>
+<div class="row">
+ <input type="text" id="path" placeholder="/path/to/project — folder to fix">
+ <input type="text" id="nag" placeholder="agents (blank = auto max)" style="max-width:180px">
+ <button onclick="start(false)">Start run</button>
+ <button class="gray" onclick="start(true)">Demo</button>
+ <button class="red" onclick="act({type:'stop'})">Stop everything</button>
+</div>
+<div id="summary" class="muted">No farm loaded. Start a run, run the demo, or launch with --target.</div>
+<div class="bar"><div id="prog" style="width:0%"></div></div>
+<div id="agents" class="grid"></div>
+<div id="report" class="mono"></div>
+<script>
+let T=null;
+async function act(body){const r=await fetch('/api/action',{method:'POST',body:JSON.stringify(body)});
+ const j=await r.json(); if(j.output) console.log(j.output); if(j.error) alert(j.error); tick();}
+function start(demo){act({type:'start',demo:demo,path:document.getElementById('path').value,
+ agents:document.getElementById('nag').value});}
+function say(i,poke){const el=document.getElementById('in'+i); if(!el.value) return;
+ act({type:poke?'poke':'say',agent:String(i),msg:el.value}); el.value='';}
+function card(i){return `<div class="card"><h3>agent ${i} <span id="st${i}" class="muted"></span></h3>
+ <pre id="feed${i}"></pre><div class="row"><input type="text" id="in${i}" placeholder="tell agent ${i} something…">
+ <button onclick="say(${i},false)">Say</button><button class="amber" onclick="say(${i},true)">Poke</button></div></div>`;}
+async function tick(){
+ const s=await (await fetch('/api/state')).json();
+ const chip=document.getElementById('chip');
+ if(!s.target){chip.textContent='no run';chip.className='chip none';return;}
+ const st=s.state||{}; const hist=st.oracle_history||[];
+ const first=hist.length?hist[0].problems:'?'; const now=st.problems_total;
+ const status=st.done?['done ✅','done']:(st.stopped?['stopped','stop']:['grinding','grind']);
+ chip.textContent=status[0]; chip.className='chip '+status[1];
+ document.getElementById('summary').textContent=
+   `${s.target} — problems ${first} → ${now} · ${st.n_agents} agents · linter: ${st.oracle||''}`;
+ document.getElementById('prog').style.width=(first>0?Math.round(100*(first-now)/first):0)+'%';
+ const ag=st.agents||{}; const ids=Object.keys(ag).sort((a,b)=>a-b);
+ const box=document.getElementById('agents');
+ if(box.dataset.sig!==ids.join()+s.target){box.dataset.sig=ids.join()+s.target;
+   box.innerHTML=ids.map(card).join('');}
+ for(const i of ids){const a=ag[i];
+   document.getElementById('st'+i).textContent=`· cycle ${a.cycle} · ${a.status}`;
+   const f=document.getElementById('feed'+i); const txt=(s.feeds&&s.feeds[i])||'';
+   if(f.textContent!==txt){f.textContent=txt; f.scrollTop=f.scrollHeight;}}
+ const rep=document.getElementById('report');
+ if(s.report){rep.style.display='block'; rep.textContent=s.report;} else rep.style.display='none';
+}
+setInterval(tick,1500); tick();
+</script></body></html>"""
+
+
+def cmd_ui(args, self_path: str):
+    import http.server
+
+    holder = {"target": Path(args.target).resolve() if args.target else None}
+
+    def api_state():
+        t = holder["target"]
+        if not t or not (farm_dir(t) / "state.json").exists():
+            return {"target": None}
+        fdir = farm_dir(t)
+        try:
+            state = json.loads((fdir / "state.json").read_text())
+        except Exception:
+            return {"target": str(t), "state": None}
+        feeds = {}
+        for i in range(state.get("n_agents", 0)):
+            fp = fdir / "agents" / str(i) / "feed.log"
+            if fp.exists():
+                feeds[str(i)] = "".join(fp.read_text().splitlines(True)[-45:])
+        rep = fdir / "report.md"
+        return {"target": str(t), "state": state, "feeds": feeds,
+                "report": rep.read_text() if rep.exists() else None}
+
+    def api_action(body):
+        kind = body.get("type")
+        if kind == "start":
+            cmd = [sys.executable, self_path]
+            if body.get("demo"):
+                cmd += ["demo", "--no-wall"]
+            else:
+                p = Path(body.get("path", "")).expanduser()
+                if not p.is_dir():
+                    return {"error": f"not a directory: {p}"}
+                cmd += ["fix", str(p), "--no-wall"]
+            if str(body.get("agents", "")).strip():
+                cmd += ["--agents", str(body["agents"]).strip()]
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 cwd=str(Path(self_path).parent), timeout=300)
+            text = out.stdout + out.stderr
+            for ln in text.splitlines():
+                if "demo target:" in ln:
+                    holder["target"] = Path(ln.split("demo target:")[1].strip())
+            if not body.get("demo") and "not a directory" not in text:
+                holder["target"] = Path(body["path"]).expanduser().resolve()
+            return {"ok": True, "output": text}
+        t = holder["target"]
+        if not t:
+            return {"error": "no active farm"}
+        if kind in ("say", "poke"):
+            cmd_say(t, body.get("agent", "all"), body.get("msg", ""),
+                    poke=(kind == "poke"))
+            return {"ok": True}
+        if kind == "stop":
+            cmd_stop(t)
+            return {"ok": True}
+        return {"error": f"unknown action {kind}"}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _json(self, obj, code=200):
+            data = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path.startswith("/api/state"):
+                return self._json(api_state())
+            data = UI_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            if not self.path.startswith("/api/action"):
+                return self._json({"error": "unknown endpoint"}, 404)
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                return self._json({"error": "bad json"}, 400)
+            try:
+                return self._json(api_action(body))
+            except Exception as e:
+                return self._json({"error": str(e)}, 500)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    url = f"http://127.0.0.1:{args.port}"
+    print(f"farm ui → {url}   (Ctrl-C to quit; runs keep going without it)")
+    if not args.no_open and sys.platform == "darwin":
+        subprocess.run(["open", url], capture_output=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nui closed — any running farm keeps grinding")
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_fix(args, self_path: str, task: str = None):
@@ -597,6 +769,12 @@ def main():
         p.add_argument("message")
         p.add_argument("--target", default=".")
 
+    p_ui = sub.add_parser("ui", help="browser dashboard: start/watch/steer/stop")
+    p_ui.add_argument("--target", default=None,
+                      help="folder of an existing run to show on load")
+    p_ui.add_argument("--port", type=int, default=8787)
+    p_ui.add_argument("--no-open", action="store_true")
+
     pr = sub.add_parser("_runner")
     pr.add_argument("--target", required=True)
     pr.add_argument("--agents", type=int, required=True)
@@ -620,6 +798,8 @@ def main():
     elif args.cmd in ("say", "poke"):
         cmd_say(Path(args.target).resolve(), args.agent, args.message,
                 poke=(args.cmd == "poke"))
+    elif args.cmd == "ui":
+        cmd_ui(args, self_path)
     elif args.cmd == "_runner":
         Runner(Path(args.target), args.agents, args.max_cycles,
                args.oracle_cmd, task=args.task).run()

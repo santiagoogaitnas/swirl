@@ -27,8 +27,21 @@ report structured events.
 ## Quickstart
 
 ```bash
-./farm demo                 # self-contained: copies examples/brokenpkg into
-                            # runs/, launches 2 agents, builds the wall
+./farm ui                   # THE front door: opens a browser dashboard.
+                            # Start runs, watch every agent live, message or
+                            # interrupt any agent, stop everything — one page.
+```
+
+The dashboard has a Demo button (disposable broken package), a Start form
+(point it at any folder), a live card per agent with a text box (**Say** =
+next cycle, **Poke** = interrupt now), a progress bar, and the final report.
+Closing the page changes nothing — runs keep grinding; reopen anytime with
+`./farm ui --target <folder>`.
+
+Terminal equivalents of everything, if you prefer:
+
+```bash
+./farm demo                 # self-contained demo run + tmux wall
 tmux attach -t farm-demo-…  # watch the wall (exact name is printed)
 
 ./farm fix ~/code/myproject # the real thing: auto-detect oracle, grind to zero
@@ -59,6 +72,7 @@ no questions, no summaries) + any queued operator message.
 
 | Command | What it does |
 |---|---|
+| `farm ui [--target P] [--port 8787]` | Browser dashboard: start / watch / steer / stop, all in one page |
 | `farm fix [path]` | Ratchet the oracle to zero problems. Flags: `--agents N`, `--max-cycles M`, `--oracle 'cmd'`, `--fg`, `--no-wall` |
 | `farm run "task" [path]` | Free-form standing task with oracle as backstop |
 | `farm demo` | Run the built-in demo on a disposable copy of `examples/brokenpkg` |
