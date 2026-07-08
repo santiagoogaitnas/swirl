@@ -113,7 +113,8 @@ def append_feed(fdir: Path, agent: int, line: str):
 
 # ---------------------------------------------------------------- oracle
 
-def detect_oracle(target: Path, override: str = None) -> str:
+def detect_oracle(target: Path, override: str = None,
+                  required: bool = True) -> str:
     """Return a shell command whose stdout is one problem per line."""
     if override:
         return override
@@ -124,8 +125,10 @@ def detect_oracle(target: Path, override: str = None) -> str:
         return f"{base} check -q --output-format concise ."
     if (target / "tsconfig.json").exists():
         return "npx tsc --noEmit --pretty false"
-    sys.exit("farm: could not auto-detect an oracle for this project; "
-             "pass one with --oracle 'cmd'")
+    if required:
+        sys.exit("farm: could not auto-detect an oracle for this project; "
+                 "pass one with --oracle 'cmd'")
+    return ""    # swirl mode needs no oracle at all
 
 
 def run_oracle(oracle_cmd: str, target: Path):
@@ -164,8 +167,9 @@ def build_prompt(agent_id: int, n_agents: int, cycle: int, slice_lines,
             f"Sort the repo's source files alphabetically; prefer files "
             f"whose index modulo {n_agents} equals {agent_id}. If another "
             f"agent clearly just changed a file, pick a different one.")
-        parts.append(f"Verification oracle: `{oracle_cmd}` "
-                     "(stdout lines = remaining problems; keep it clean).")
+        if oracle_cmd:
+            parts.append(f"Verification oracle: `{oracle_cmd}` "
+                         "(stdout lines = remaining problems; keep it clean).")
         if slice_lines:
             parts.append("Oracle problems currently open:\n"
                          + "\n".join(f"- {ln}" for ln in slice_lines))
@@ -256,6 +260,8 @@ class Runner:
     # ---- oracle wrapper (serialized, records history)
 
     def oracle(self):
+        if not self.oracle_cmd:
+            return []
         with self.lock:
             problems = run_oracle(self.oracle_cmd, self.target)
             self.state["problems_total"] = len(problems)
@@ -513,29 +519,25 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
 </style></head><body>
 <h1>🚜 farm <span id="chip" class="chip none">no run</span></h1>
 <div class="row">
- <input type="text" id="path" placeholder="/path/to/project — folder to work on">
- <input type="text" id="nag" placeholder="agents (blank = auto max)" style="max-width:180px">
+ <input type="text" id="path" placeholder="folder — /path/to/project">
+ <input type="text" id="nag" value="20" style="max-width:110px" title="how many agents">
 </div>
 <div class="row">
- <input type="text" id="orc" placeholder="problem detector (optional) — ANY command printing one problem per line: pytest, mypy, grep -rn TODO … blank = auto linter">
+ <input type="text" id="task" placeholder="what should they do — they'll do it, reset, and do it again, forever, until you stop them">
+ <button onclick="start()">LAUNCH</button>
+ <button class="red" onclick="act({type:'stop'})">Stop</button>
 </div>
-<div class="row">
- <input type="text" id="task" placeholder="instruction (optional) — WITH it: agents grind forever, pass after pass, until you stop. BLANK: fix lint problems to zero.">
- <button onclick="start(false)">Start run</button>
- <button class="gray" onclick="start(true)">Demo</button>
- <button class="red" onclick="act({type:'stop'})">Stop everything</button>
-</div>
-<div id="summary" class="muted">No farm loaded. Start a run, run the demo, or launch with --target.</div>
-<div class="bar"><div id="prog" style="width:0%"></div></div>
+<div id="summary" class="muted">Nothing swirling. Fill the three boxes, hit LAUNCH.</div>
 <div id="agents" class="grid"></div>
 <div id="report" class="mono"></div>
 <script>
 let T=null;
 async function act(body){const r=await fetch('/api/action',{method:'POST',body:JSON.stringify(body)});
  const j=await r.json(); if(j.output) console.log(j.output); if(j.error) alert(j.error); tick();}
-function start(demo){act({type:'start',demo:demo,path:document.getElementById('path').value,
- agents:document.getElementById('nag').value,task:document.getElementById('task').value,
- oracle:document.getElementById('orc').value});}
+function start(){const t=document.getElementById('task').value.trim();
+ if(!t){alert('tell them what to do');return;}
+ act({type:'start',path:document.getElementById('path').value,
+ agents:document.getElementById('nag').value,task:t});}
 function say(i,poke){const el=document.getElementById('in'+i); if(!el.value) return;
  act({type:poke?'poke':'say',agent:String(i),msg:el.value}); el.value='';}
 function card(i){return `<div class="card"><h3>agent ${i} <span id="st${i}" class="muted"></span></h3>
@@ -547,14 +549,15 @@ async function tick(){
  if(!s.target){chip.textContent='no run';chip.className='chip none';return;}
  const st=s.state||{}; const hist=st.oracle_history||[];
  const first=hist.length?hist[0].problems:'?'; const now=st.problems_total;
- const status=st.done?['done ✅','done']:(st.stopped?['stopped','stop']:['grinding','grind']);
+ const status=st.done?['done ✅','done']:(st.stopped?['stopped','stop']:['swirling','grind']);
  chip.textContent=status[0]; chip.className='chip '+status[1];
- const cyc=st.max_cycles===0?'∞ until you stop':(st.max_cycles+' cycles max');
- document.getElementById('summary').textContent=
-   (st.task?`∞ GRIND: "${st.task.slice(0,90)}…" · ${cyc} · `:'')+
-   `${s.target} — problems ${first} → ${now} · ${st.n_agents} agents · linter: ${st.oracle||''}`;
- document.getElementById('prog').style.width=(first>0?Math.round(100*(first-now)/first):0)+'%';
  const ag=st.agents||{}; const ids=Object.keys(ag).sort((a,b)=>a-b);
+ const passes=ids.reduce((a,i)=>a+(ag[i].cycle||0),0);
+ document.getElementById('summary').textContent=
+   `${st.n_agents} agents · ${passes} passes so far`+
+   (st.task?` · "${st.task.slice(0,80)}"`:'')+
+   (now!=null&&first!=='?'?` · problems ${first} → ${now}`:'')+
+   ` · ${s.target}`;
  const box=document.getElementById('agents');
  if(box.dataset.sig!==ids.join()+s.target){box.dataset.sig=ids.join()+s.target;
    box.innerHTML=ids.map(card).join('');}
@@ -608,10 +611,9 @@ def cmd_ui(args, self_path: str):
                 p = Path(body.get("path", "")).expanduser()
                 if not p.is_dir():
                     return {"error": f"not a directory: {p}"}
-                if task:
-                    cmd += ["run", task, str(p), "--no-wall"]
-                else:
-                    cmd += ["fix", str(p), "--no-wall"]
+                if not task:
+                    return {"error": "tell them what to do"}
+                cmd += ["run", task, str(p), "--no-wall"]
             if str(body.get("agents", "")).strip():
                 cmd += ["--agents", str(body["agents"]).strip()]
             if str(body.get("oracle", "")).strip() and not body.get("demo"):
@@ -689,9 +691,12 @@ def cmd_fix(args, self_path: str, task: str = None):
     target = Path(args.path).resolve()
     if not target.is_dir():
         sys.exit(f"farm: no such directory {target}")
-    oracle_cmd = detect_oracle(target, args.oracle)
-    problems = run_oracle(oracle_cmd, target)
-    print(f"→ oracle: `{oracle_cmd}` → {len(problems)} problems")
+    oracle_cmd = detect_oracle(target, args.oracle, required=not task)
+    problems = run_oracle(oracle_cmd, target) if oracle_cmd else []
+    if oracle_cmd:
+        print(f"→ oracle: `{oracle_cmd}` → {len(problems)} problems")
+    else:
+        print("→ no linter here — pure swirl, no problem tracking")
     if not problems and not task:
         print("→ oracle already clean; nothing to do")
         return
@@ -699,19 +704,15 @@ def cmd_fix(args, self_path: str, task: str = None):
         else (0 if task else DEFAULT_MAX_CYCLES)
     cyc = "∞ (until `farm stop`)" if max_cycles == 0 else str(max_cycles)
     if task:
-        # grind has no finish line, so size by the whole workable surface
-        files = len([p for ext in ("*.py", "*.ts", "*.tsx", "*.js")
-                     for p in target.rglob(ext)
-                     if ".farm" not in p.parts and ".venv" not in p.parts])
-        bound = "source files"
+        # swirl mode: the fleet is YOUR number, nothing derives it
+        n = args.agents or FLEET_DEFAULT
+        why = "your number, uncapped" if args.agents else f"default {FLEET_DEFAULT}"
     else:
-        files = len({ln.split(":", 1)[0] for ln in problems})
-        bound = "files with problems (one file per agent per cycle)"
-    files = files or 1
-    n = args.agents or max(1, min(FLEET_DEFAULT, files))
-    why = ("set by --agents, uncapped" if args.agents
-           else f"default {FLEET_DEFAULT}, bounded only by {files} {bound}; "
-                f"force any size with --agents")
+        files = len({ln.split(":", 1)[0] for ln in problems}) or 1
+        n = args.agents or max(1, min(FLEET_DEFAULT, files))
+        why = ("set by --agents, uncapped" if args.agents
+               else f"default {FLEET_DEFAULT}, bounded only by {files} files "
+                    f"with problems (one file per agent per cycle)")
     print(f"→ fleet: {n} agents ({why})")
     if task:
         print(f"→ mode: GRIND — finish a pass, go again, go again; "
