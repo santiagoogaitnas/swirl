@@ -164,7 +164,13 @@ Known simplifications, roughly in the order they'd matter:
 
 ## Lineage
 
-- Original: [Dicklesworthstone/claude_code_agent_farm](https://github.com/Dicklesworthstone/claude_code_agent_farm)
-- Local og copy: `~/0DEVELOPMENT/bigclaude copy` (kept pristine as reference)
-- This rebuild keeps the og farm's soul — the forced-cycle ratchet that stops
-  Claude from satisficing — and discards its transport (TUI scraping).
+- Spiritual ancestor: [Dicklesworthstone/claude_code_agent_farm](https://github.com/Dicklesworthstone/claude_code_agent_farm),
+  which drove a wall of Claude Code TUIs through tmux keystrokes and
+  screen-scraping.
+- This is a from-scratch rebuild that keeps the og farm's soul — the
+  forced-cycle swirl that never lets Claude decide it's done — and discards
+  its transport (TUI scraping) for Claude Code's headless JSON interface.
+
+## License
+
+MIT
