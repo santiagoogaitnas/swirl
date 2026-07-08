@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-farm — headless rebuild of the Claude Code Agent Farm ("bigclaude").
+swirl — parallel Claude Code agents that never stop.
 
-Design contract (the whole point of v2):
-  1. The RUNNER drives Claude Code programmatically (`claude -p --output-format
-     stream-json`). State comes from structured events, never from screen text.
-  2. The WALL is a tmux grid that only *renders* state files. Data flows
-     events -> files -> screen. The farm never reads the screen.
-  3. The RATCHET: an external oracle (linter/type-checker) decides whether work
-     continues. An agent's own "done" never terminates the loop. Every cycle is
-     a fresh session (cold context).
+Pick a folder, a fleet size, an instruction. Each agent runs a fresh headless
+Claude Code session, finishes a pass, resets cold, and goes again — until you
+stop it. The browser page and the tmux wall are read-only views of the state
+files in <target>/.swirl/.
 
-Zero dependencies. Python 3.9+. State lives in <target>/.farm/.
+Zero dependencies. Python 3.9+.
 """
 
 import argparse
@@ -29,8 +25,8 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- constants
 
-FARM_DIRNAME = ".farm"
-FLEET_DEFAULT = 20      # og farm's default; throw agents at it, not thrift
+FARM_DIRNAME = ".swirl"
+FLEET_DEFAULT = 20      # throw agents at it, not thrift
 DEFAULT_MAX_CYCLES = 10
 SLICE_CAP = 15          # max problems handed to one agent per cycle
 POLL_SECS = 2.0         # poke-flag / state-flush cadence
@@ -89,7 +85,7 @@ def resolve_claude():
                  Path("/usr/local/bin/claude")):
         if cand.exists():
             return str(cand)
-    sys.exit("farm: cannot find the `claude` binary (set FARM_CLAUDE_BIN)")
+    sys.exit("swirl: cannot find the `claude` binary (set FARM_CLAUDE_BIN)")
 
 
 def farm_dir(target: Path) -> Path:
@@ -97,7 +93,7 @@ def farm_dir(target: Path) -> Path:
 
 
 def session_name(target: Path) -> str:
-    return f"farm-{target.name.replace('.', '_').replace(' ', '_')}"
+    return f"swirl-{target.name.replace('.', '_').replace(' ', '_')}"
 
 
 def atomic_write_json(path: Path, obj):
@@ -126,7 +122,7 @@ def detect_oracle(target: Path, override: str = None,
     if (target / "tsconfig.json").exists():
         return "npx tsc --noEmit --pretty false"
     if required:
-        sys.exit("farm: could not auto-detect an oracle for this project; "
+        sys.exit("swirl: could not auto-detect an oracle for this project; "
                  "pass one with --oracle 'cmd'")
     return ""    # swirl mode needs no oracle at all
 
@@ -153,7 +149,7 @@ def build_prompt(agent_id: int, n_agents: int, cycle: int, slice_lines,
     if operator_msg:
         parts.append("OPERATOR MESSAGE — HIGHEST PRIORITY, OBEY FIRST:\n"
                      f"{operator_msg}\n")
-    parts.append(f"You are farm agent {agent_id} of {n_agents} "
+    parts.append(f"You are swirl agent {agent_id} of {n_agents} "
                  f"(cycle {cycle}) working in this repository.")
     if task:
         parts.append(f"Your standing task:\n{task}")
@@ -295,7 +291,7 @@ class Runner:
     def agent_loop(self, i: int):
         adir = self.fdir / "agents" / str(i)
         cycle = 0
-        # max_cycles == 0 means FOREVER — the og farm's soul: finish a pass,
+        # max_cycles == 0 means FOREVER — no finish line: finish a pass,
         # go again, go again, until the operator says stop.
         while not self.stop.is_set() and \
                 (self.max_cycles == 0 or cycle < self.max_cycles):
@@ -419,7 +415,7 @@ class Runner:
         first = hist[0]["problems"] if hist else "?"
         last = hist[-1]["problems"] if hist else "?"
         cycles = sum(a["cycle"] for a in self.state["agents"].values())
-        report = (f"# farm report · {now_iso()}\n\n"
+        report = (f"# swirl report · {now_iso()}\n\n"
                   f"- target: {self.target}\n"
                   f"- oracle: `{self.oracle_cmd}`\n"
                   f"- problems: {first} -> {last}\n"
@@ -434,10 +430,10 @@ class Runner:
 
 def cmd_watch(target: Path, self_path: str):
     """Build the tmux wall: pane 0 = fleet status, one pane per agent feed.
-    tmux is write-only: we create panes and run tail/status in them. The farm
+    tmux is write-only: we create panes and run tail/status in them. swirl
     never reads the screen."""
     if not shutil.which("tmux"):
-        sys.exit("farm watch: tmux not found")
+        sys.exit("swirl watch: tmux not found")
     fdir = farm_dir(target)
     state = json.loads((fdir / "state.json").read_text())
     sess = session_name(target)
@@ -465,14 +461,14 @@ def cmd_status(target: Path, live: bool):
         try:
             s = json.loads(spath.read_text())
         except Exception:
-            return "no farm state yet"
+            return "nothing swirling here yet"
         out = []
         prob = s.get("problems_total")
         hist = s.get("oracle_history", [])
         first = hist[0]["problems"] if hist else "?"
         flag = ("✅ DONE — oracle clean" if s.get("done")
                 else ("⛔ stopped" if s.get("stopped") else "🜄 grinding"))
-        out.append(f"FARM {s.get('target', '')}")
+        out.append(f"SWIRL {s.get('target', '')}")
         out.append(f"{flag} · problems {first} → {prob} · "
                    f"oracle `{s.get('oracle', '')}`")
         out.append("")
@@ -481,8 +477,8 @@ def cmd_status(target: Path, live: bool):
             out.append(f"{i:>3} {a.get('cycle', 0):>5}  "
                        f"{a.get('status', '?'):<9} {a.get('last', '')[:110]}")
         out.append("")
-        out.append("steer:  farm say <n> \"msg\"   ·   farm poke <n> \"msg\""
-                   "   ·   farm stop")
+        out.append("steer:  swirl say <n> \"msg\"   ·   swirl poke <n> \"msg\""
+                   "   ·   swirl stop")
         return "\n".join(out)
 
     if not live:
@@ -500,7 +496,7 @@ def cmd_status(target: Path, live: bool):
 # ---------------------------------------------------------------- web ui
 
 UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<title>farm</title><style>
+<title>swirl</title><style>
  body{background:#111;color:#ddd;font:14px -apple-system,sans-serif;margin:0;padding:20px}
  h1{font-size:18px;margin:0 0 12px} .muted{color:#888} .mono{font-family:ui-monospace,monospace}
  .bar{background:#222;border-radius:6px;height:14px;overflow:hidden;margin:8px 0}
@@ -517,7 +513,7 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
  .grind{background:#a80} .done{background:#2a4} .stop{background:#a33} .none{background:#444}
  #report{background:#152015;border:1px solid #2a4;border-radius:8px;padding:12px;margin-top:14px;white-space:pre-wrap;display:none}
 </style></head><body>
-<h1>🚜 farm <span id="chip" class="chip none">no run</span></h1>
+<h1>🌀 swirl <span id="chip" class="chip none">no run</span></h1>
 <div class="row">
  <input type="text" id="path" placeholder="folder — /path/to/project">
  <input type="text" id="nag" value="20" style="max-width:110px" title="how many agents">
@@ -605,31 +601,21 @@ def cmd_ui(args, self_path: str):
         if kind == "start":
             cmd = [sys.executable, self_path]
             task = str(body.get("task", "")).strip()
-            if body.get("demo"):
-                cmd += ["demo", "--no-wall"]
-            else:
-                p = Path(body.get("path", "")).expanduser()
-                if not p.is_dir():
-                    return {"error": f"not a directory: {p}"}
-                if not task:
-                    return {"error": "tell them what to do"}
-                cmd += ["run", task, str(p), "--no-wall"]
+            p = Path(body.get("path", "")).expanduser()
+            if not p.is_dir():
+                return {"error": f"not a directory: {p}"}
+            if not task:
+                return {"error": "tell them what to do"}
+            cmd += ["run", task, str(p), "--no-wall"]
             if str(body.get("agents", "")).strip():
                 cmd += ["--agents", str(body["agents"]).strip()]
-            if str(body.get("oracle", "")).strip() and not body.get("demo"):
-                cmd += ["--oracle", str(body["oracle"]).strip()]
             out = subprocess.run(cmd, capture_output=True, text=True,
                                  cwd=str(Path(self_path).parent), timeout=300)
-            text = out.stdout + out.stderr
-            for ln in text.splitlines():
-                if "demo target:" in ln:
-                    holder["target"] = Path(ln.split("demo target:")[1].strip())
-            if not body.get("demo") and "not a directory" not in text:
-                holder["target"] = Path(body["path"]).expanduser().resolve()
-            return {"ok": True, "output": text}
+            holder["target"] = p.resolve()
+            return {"ok": True, "output": out.stdout + out.stderr}
         t = holder["target"]
         if not t:
-            return {"error": "no active farm"}
+            return {"error": "nothing swirling"}
         if kind in ("say", "poke"):
             cmd_say(t, body.get("agent", "all"), body.get("msg", ""),
                     poke=(kind == "poke"))
@@ -676,13 +662,13 @@ def cmd_ui(args, self_path: str):
 
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"
-    print(f"farm ui → {url}   (Ctrl-C to quit; runs keep going without it)")
+    print(f"swirl ui → {url}   (Ctrl-C to quit; runs keep going without it)")
     if not args.no_open and sys.platform == "darwin":
         subprocess.run(["open", url], capture_output=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nui closed — any running farm keeps grinding")
+        print("\nui closed — any running swirl keeps going")
 
 
 # ---------------------------------------------------------------- commands
@@ -690,7 +676,7 @@ def cmd_ui(args, self_path: str):
 def cmd_fix(args, self_path: str, task: str = None):
     target = Path(args.path).resolve()
     if not target.is_dir():
-        sys.exit(f"farm: no such directory {target}")
+        sys.exit(f"swirl: no such directory {target}")
     oracle_cmd = detect_oracle(target, args.oracle, required=not task)
     problems = run_oracle(oracle_cmd, target) if oracle_cmd else []
     if oracle_cmd:
@@ -702,7 +688,7 @@ def cmd_fix(args, self_path: str, task: str = None):
         return
     max_cycles = args.max_cycles if args.max_cycles is not None \
         else (0 if task else DEFAULT_MAX_CYCLES)
-    cyc = "∞ (until `farm stop`)" if max_cycles == 0 else str(max_cycles)
+    cyc = "∞ (until `swirl stop`)" if max_cycles == 0 else str(max_cycles)
     if task:
         # swirl mode: the fleet is YOUR number, nothing derives it
         n = args.agents or FLEET_DEFAULT
@@ -717,13 +703,13 @@ def cmd_fix(args, self_path: str, task: str = None):
     if task:
         print(f"→ mode: GRIND — finish a pass, go again, go again; "
               f"cycles: {cyc}")
-        print("→ stops when: YOU say `farm stop`"
+        print("→ stops when: YOU say `swirl stop`"
               + ("" if max_cycles == 0 else " · or cycle budget runs out"))
     else:
         print(f"→ mode: FIX — each agent works its own slice of files, "
               f"max {cyc} cycles each")
         print("→ stops when: oracle reports 0 problems · or cycles "
-              "exhausted · or `farm stop`")
+              "exhausted · or `swirl stop`")
     fdir = farm_dir(target)
     fdir.mkdir(exist_ok=True)
     # wipe per-run state, keep old reports
@@ -741,7 +727,7 @@ def cmd_fix(args, self_path: str, task: str = None):
     log = open(fdir / "runner.log", "a")
     proc = subprocess.Popen(runner_cmd, start_new_session=True,
                             stdout=log, stderr=log)
-    # remember the newest run so `farm ui` / restarts auto-attach to it
+    # remember the newest run so `swirl ui` / restarts auto-attach to it
     try:
         (Path(self_path).parent / ".last_target").write_text(str(target))
     except OSError:
@@ -750,39 +736,9 @@ def cmd_fix(args, self_path: str, task: str = None):
     time.sleep(1.5)          # let state.json appear before building the wall
     if not args.no_wall:
         cmd_watch(target, self_path)
-    print(f"→ steer: farm say <n> \"msg\" (next cycle) · farm poke <n> "
-          f"\"msg\" (interrupt now) · farm status --live")
+    print(f"→ steer: swirl say <n> \"msg\" (next cycle) · swirl poke <n> "
+          f"\"msg\" (interrupt now) · swirl status --live")
     print(f"→ logs: {fdir}/  ·  report lands at {fdir}/report.md")
-
-
-def cmd_demo(args, self_path: str):
-    root = Path(self_path).resolve().parent
-    src = root / "examples" / "brokenpkg"
-    runs = root / "runs"
-    runs.mkdir(exist_ok=True)
-    dst = runs / f"demo-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    shutil.copytree(src, dst)
-    print(f"→ demo target: {dst}")
-    oracle_cmd = detect_oracle(dst)
-    dirty = len(run_oracle(oracle_cmd, dst))
-    if dirty:
-        ns = argparse.Namespace(path=str(dst), oracle=None,
-                                agents=args.agents, max_cycles=4,
-                                fg=False, no_wall=args.no_wall)
-        cmd_fix(ns, self_path)
-    else:
-        # sample package is clean → show the og soul instead: agents that
-        # finish a pass and GO AGAIN (bounded so an unattended demo ends)
-        print("→ sample is lint-clean → GRIND demo: agents improve it in "
-              "endless passes (demo-capped at 6 cycles each; `farm stop` "
-              "or the UI stop button ends it sooner)")
-        ns = argparse.Namespace(path=str(dst), oracle=None,
-                                agents=args.agents, max_cycles=6,
-                                fg=False, no_wall=args.no_wall)
-        cmd_fix(ns, self_path, task=(
-            "Make this package genuinely excellent, one concrete improvement "
-            "per cycle: docstrings, type hints, input validation, error "
-            "handling, tests if none exist. Keep the linter clean."))
 
 
 def cmd_say(target: Path, agent: str, msg: str, poke: bool):
@@ -818,7 +774,7 @@ def cmd_stop(target: Path):
 
 def main():
     self_path = os.path.realpath(__file__)
-    ap = argparse.ArgumentParser(prog="farm", description=__doc__)
+    ap = argparse.ArgumentParser(prog="swirl", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add_common(p):
@@ -836,10 +792,6 @@ def main():
     p_run = sub.add_parser("run", help="free-form task with oracle backstop")
     p_run.add_argument("task")
     add_common(p_run)
-
-    p_demo = sub.add_parser("demo", help="self-contained demo on a broken pkg")
-    p_demo.add_argument("--agents", type=int, default=None)
-    p_demo.add_argument("--no-wall", action="store_true")
 
     for name in ("status", "watch", "stop"):
         p = sub.add_parser(name)
@@ -871,8 +823,6 @@ def main():
         cmd_fix(args, self_path)
     elif args.cmd == "run":
         cmd_fix(args, self_path, task=args.task)
-    elif args.cmd == "demo":
-        cmd_demo(args, self_path)
     elif args.cmd == "watch":
         cmd_watch(Path(args.target).resolve(), self_path)
     elif args.cmd == "status":

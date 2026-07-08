@@ -1,6 +1,7 @@
 runs/
-.last_target
+.swirl/
 .farm/
+.last_target
 __pycache__/
 *.pyc
 .DS_Store
