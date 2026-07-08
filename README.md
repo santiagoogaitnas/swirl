@@ -34,6 +34,24 @@ tmux attach -t farm-demo-…  # watch the wall (exact name is printed)
 ./farm fix ~/code/myproject # the real thing: auto-detect oracle, grind to zero
 ```
 
+What a launch looks like — every decision is printed:
+
+```
+→ oracle: `uvx ruff check -q --output-format concise .` → 29 problems
+→ fleet: 2 agents (auto-sized: 1 agent per ~12 problems, min 2, cap 8)
+→ plan: each agent loops fresh Claude sessions over its own slice of files, max 10 cycles each
+→ stops when: oracle reports 0 problems · or cycles exhausted · or `farm stop`
+→ runner pid 57316 · 2 agents · max 10 cycles/agent
+wall ready → tmux attach -t farm-myproject
+→ steer: farm say <n> "msg" (next cycle) · farm poke <n> "msg" (interrupt now) · farm status --live
+→ logs: …/.farm/  ·  report lands at …/.farm/report.md
+```
+
+Fleet sizing: `agents = min(8, max(2, problems // 12))`, override with
+`--agents N`. Each agent's cycle prompt = its file slice + the ratchet rules
+(root causes only, no suppressions, verify each fix against the oracle, no
+questions, no summaries) + any queued operator message.
+
 ## Commands
 
 | Command | What it does |
