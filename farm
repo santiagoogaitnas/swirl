@@ -30,6 +30,7 @@ from pathlib import Path
 # ---------------------------------------------------------------- constants
 
 FARM_DIRNAME = ".farm"
+FLEET_DEFAULT = 20      # og farm's default; throw agents at it, not thrift
 DEFAULT_MAX_CYCLES = 10
 SLICE_CAP = 15          # max problems handed to one agent per cycle
 POLL_SECS = 2.0         # poke-flag / state-flush cadence
@@ -478,9 +479,12 @@ def cmd_fix(args, self_path: str, task: str = None):
     if not problems and not task:
         print("→ oracle already clean; nothing to do")
         return
-    n = args.agents or min(8, max(2, len(problems) // 12 or 2))
-    why = ("set by --agents" if args.agents
-           else "auto-sized: 1 agent per ~12 problems, min 2, cap 8")
+    files = len({ln.split(":", 1)[0] for ln in problems}) or 1
+    n = args.agents or max(1, min(FLEET_DEFAULT, files))
+    why = ("set by --agents, uncapped" if args.agents
+           else f"default {FLEET_DEFAULT}, bounded only by {files} files "
+                f"with problems (one file per agent per cycle); "
+                f"force any size with --agents")
     print(f"→ fleet: {n} agents ({why})")
     print(f"→ plan: each agent loops fresh Claude sessions over its own "
           f"slice of files, max {args.max_cycles} cycles each")
@@ -578,7 +582,7 @@ def main():
     add_common(p_run)
 
     p_demo = sub.add_parser("demo", help="self-contained demo on a broken pkg")
-    p_demo.add_argument("--agents", type=int, default=2)
+    p_demo.add_argument("--agents", type=int, default=None)
     p_demo.add_argument("--no-wall", action="store_true")
 
     for name in ("status", "watch", "stop"):

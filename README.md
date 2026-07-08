@@ -38,19 +38,22 @@ What a launch looks like — every decision is printed:
 
 ```
 → oracle: `uvx ruff check -q --output-format concise .` → 29 problems
-→ fleet: 2 agents (auto-sized: 1 agent per ~12 problems, min 2, cap 8)
+→ fleet: 3 agents (default 20, bounded only by 3 files with problems (one file per agent per cycle); force any size with --agents)
 → plan: each agent loops fresh Claude sessions over its own slice of files, max 10 cycles each
 → stops when: oracle reports 0 problems · or cycles exhausted · or `farm stop`
-→ runner pid 57316 · 2 agents · max 10 cycles/agent
+→ runner pid 57316 · 3 agents · max 10 cycles/agent
 wall ready → tmux attach -t farm-myproject
 → steer: farm say <n> "msg" (next cycle) · farm poke <n> "msg" (interrupt now) · farm status --live
 → logs: …/.farm/  ·  report lands at …/.farm/report.md
 ```
 
-Fleet sizing: `agents = min(8, max(2, problems // 12))`, override with
-`--agents N`. Each agent's cycle prompt = its file slice + the ratchet rules
-(root causes only, no suppressions, verify each fix against the oracle, no
-questions, no summaries) + any queued operator message.
+Fleet sizing: **maximum agents is the philosophy** (the og farm defaulted to
+20 and never asked whether the problems "deserved" them). Auto mode is
+`min(20, files-with-problems)` — the file bound is physical, not thrift: two
+agents editing one file collide under the current slicing. `--agents N` is
+law and uncapped. Each agent's cycle prompt = its file slice + the ratchet
+rules (root causes only, no suppressions, verify each fix against the oracle,
+no questions, no summaries) + any queued operator message.
 
 ## Commands
 
