@@ -68,6 +68,20 @@ law and uncapped. Each agent's cycle prompt = its file slice + the ratchet
 rules (root causes only, no suppressions, verify each fix against the oracle,
 no questions, no summaries) + any queued operator message.
 
+## Not just linting
+
+The "oracle" is any command whose stdout is one problem per line — the linter
+is only the auto-detected default. The problem-detector box in the UI (or
+`--oracle 'cmd'`) accepts anything:
+
+| Oracle | What the farm grinds to zero |
+|---|---|
+| *(blank)* | auto: `ruff` (Python) / `tsc` (TypeScript) |
+| `pytest -q 2>&1 \| grep -E '^FAILED'` | failing tests |
+| `mypy . \| grep error:` | type errors |
+| `grep -rn "TODO" src/` | your TODO backlog |
+| any script you write | whatever criteria it prints |
+
 ## The two modes
 
 **FIX** (`farm fix path`, or Start with a blank instruction) has a finish

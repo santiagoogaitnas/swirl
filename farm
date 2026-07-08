@@ -517,6 +517,9 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <input type="text" id="nag" placeholder="agents (blank = auto max)" style="max-width:180px">
 </div>
 <div class="row">
+ <input type="text" id="orc" placeholder="problem detector (optional) — ANY command printing one problem per line: pytest, mypy, grep -rn TODO … blank = auto linter">
+</div>
+<div class="row">
  <input type="text" id="task" placeholder="instruction (optional) — WITH it: agents grind forever, pass after pass, until you stop. BLANK: fix lint problems to zero.">
  <button onclick="start(false)">Start run</button>
  <button class="gray" onclick="start(true)">Demo</button>
@@ -531,7 +534,8 @@ let T=null;
 async function act(body){const r=await fetch('/api/action',{method:'POST',body:JSON.stringify(body)});
  const j=await r.json(); if(j.output) console.log(j.output); if(j.error) alert(j.error); tick();}
 function start(demo){act({type:'start',demo:demo,path:document.getElementById('path').value,
- agents:document.getElementById('nag').value,task:document.getElementById('task').value});}
+ agents:document.getElementById('nag').value,task:document.getElementById('task').value,
+ oracle:document.getElementById('orc').value});}
 function say(i,poke){const el=document.getElementById('in'+i); if(!el.value) return;
  act({type:poke?'poke':'say',agent:String(i),msg:el.value}); el.value='';}
 function card(i){return `<div class="card"><h3>agent ${i} <span id="st${i}" class="muted"></span></h3>
@@ -605,6 +609,8 @@ def cmd_ui(args, self_path: str):
                     cmd += ["fix", str(p), "--no-wall"]
             if str(body.get("agents", "")).strip():
                 cmd += ["--agents", str(body["agents"]).strip()]
+            if str(body.get("oracle", "")).strip() and not body.get("demo"):
+                cmd += ["--oracle", str(body["oracle"]).strip()]
             out = subprocess.run(cmd, capture_output=True, text=True,
                                  cwd=str(Path(self_path).parent), timeout=300)
             text = out.stdout + out.stderr
