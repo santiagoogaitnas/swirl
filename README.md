@@ -41,6 +41,11 @@ builds on it instead of redoing it. Everything each agent does is written to
 `<target>/.swirl/` — live feeds, fleet state, claims, worklog, a report. The
 browser page and the tmux wall are read-only views of those files.
 
+One fleet per folder: launching onto a target that already has a live fleet
+is refused until you `swirl stop` it. And the page always matches the code
+on disk — `./swirl ui` replaces an outdated page server instead of
+reattaching to it.
+
 ## Requirements
 
 - `claude` CLI, logged in (agents run with `--dangerously-skip-permissions`
