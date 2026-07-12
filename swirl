@@ -97,6 +97,51 @@ def session_name(target: Path) -> str:
     return f"swirl-{target.name.replace('.', '_').replace(' ', '_')}"
 
 
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False    # kill(<=0, 0) probes a group, not a process
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True     # exists, just not ours
+
+
+def acquire_farm(fdir: Path, target: Path):
+    """One fleet per target: farm.pid doubles as the launch lock, taken by
+    atomic O_EXCL create — create-as-claim, the same move the agents use on
+    claims/. Live pid inside -> refuse (stop the old fleet first); dead or
+    garbage pid -> stale, clear it and take over: single-host by
+    construction, so the kernel is the liveness oracle. The read-back
+    catches the one theft window — a same-instant launch judging our
+    created-but-not-yet-written lock stale."""
+    pid_file = fdir / "farm.pid"
+    for _ in range(2):          # second pass after clearing a stale pid
+        try:
+            fd = os.open(str(pid_file),
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            try:
+                if pid_file.read_text().strip() == str(os.getpid()):
+                    return
+            except OSError:
+                pass            # stolen and gone — next pass settles it
+        except FileExistsError:
+            try:
+                pid = int(pid_file.read_text().strip())
+            except (ValueError, OSError):
+                pid = 0
+            if pid_alive(pid):
+                sys.exit(f"swirl: a fleet is already running on {target} "
+                         f"(pid {pid}) — stop it first: "
+                         f"swirl stop --target {target}")
+            pid_file.unlink(missing_ok=True)
+    sys.exit("swirl: lost a launch race — try again")
+
+
 def atomic_write_json(path: Path, obj):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(obj, indent=1))
@@ -756,6 +801,12 @@ def cmd_ui(args, self_path: str):
             out = subprocess.run(cmd, capture_output=True, text=True,
                                  cwd=str(Path(self_path).parent), timeout=300)
             holder["target"] = p.resolve()
+            if out.returncode != 0:
+                # surface the refusal where the operator can see it: only
+                # j.error reaches the page, j.output is console.log-only
+                lines = [ln for ln in (out.stdout + out.stderr).splitlines()
+                         if ln.strip()]
+                return {"error": lines[-1] if lines else "launch failed"}
             return {"ok": True, "output": out.stdout + out.stderr}
         t = holder["target"]
         if not t:
@@ -864,6 +915,7 @@ def cmd_fix(args, self_path: str, task: str = None):
               "exhausted · or `swirl stop`")
     fdir = farm_dir(target)
     fdir.mkdir(exist_ok=True)
+    acquire_farm(fdir, target)
     # wipe per-run state, keep old reports
     for sub in ("agents", "inbox", "poke", "claims"):
         shutil.rmtree(fdir / sub, ignore_errors=True)
@@ -880,6 +932,9 @@ def cmd_fix(args, self_path: str, task: str = None):
     log = open(fdir / "runner.log", "a")
     proc = subprocess.Popen(runner_cmd, start_new_session=True,
                             stdout=log, stderr=log)
+    # the lock outlives the launcher: retag farm.pid from our pid to the
+    # runner's before we exit (the runner rewrites the same value at startup)
+    (fdir / "farm.pid").write_text(str(proc.pid))
     # remember the newest run so `swirl ui` / restarts auto-attach to it
     try:
         (Path(self_path).parent / ".last_target").write_text(str(target))
