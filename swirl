@@ -11,6 +11,8 @@ Zero dependencies. Python 3.9+.
 """
 
 import argparse
+import errno
+import hashlib
 import json
 import os
 import shlex
@@ -31,6 +33,9 @@ DEFAULT_MAX_CYCLES = 10
 SLICE_CAP = 15          # max problems handed to one agent per cycle
 POLL_SECS = 2.0         # poke-flag / state-flush cadence
 CLAIM_SWEEP_SECS = 900  # malformed (non-symlink) claims older than this die
+# hashed once at import — a server must report the bytes it LOADED, not
+# whatever sits on disk at request time
+SERVER_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
 
 def slice_for(problems, agent_id: int, n_agents: int):
     """Partition problems by FILE (path prefix before the first ':'), then
@@ -759,6 +764,7 @@ setInterval(tick,1500); tick();
 
 def cmd_ui(args, self_path: str):
     import http.server
+    import urllib.request
 
     holder = {"target": Path(args.target).resolve() if args.target else None}
     last = Path(self_path).parent / ".last_target"
@@ -770,12 +776,13 @@ def cmd_ui(args, self_path: str):
     def api_state():
         t = holder["target"]
         if not t or not (farm_dir(t) / "state.json").exists():
-            return {"target": None}
+            return {"target": None, "server_version": SERVER_VERSION}
         fdir = farm_dir(t)
         try:
             state = json.loads((fdir / "state.json").read_text())
         except Exception:
-            return {"target": str(t), "state": None}
+            return {"target": str(t), "state": None,
+                    "server_version": SERVER_VERSION}
         feeds = {}
         for i in range(state.get("n_agents", 0)):
             fp = fdir / "agents" / str(i) / "feed.log"
@@ -792,7 +799,7 @@ def cmd_ui(args, self_path: str):
                     pass
         rep = fdir / "report.md"
         return {"target": str(t), "state": state, "feeds": feeds,
-                "claims": claims,
+                "claims": claims, "server_version": SERVER_VERSION,
                 "report": rep.read_text() if rep.exists() else None}
 
     def api_action(body):
@@ -869,15 +876,65 @@ def cmd_ui(args, self_path: str):
                 return self._json({"error": str(e)}, 500)
 
     url = f"http://127.0.0.1:{args.port}"
+
+    def bind():
+        return http.server.ThreadingHTTPServer(("127.0.0.1", args.port),
+                                               Handler)
+
+    def port_holder():
+        out = subprocess.run(["lsof", "-ti", f":{args.port}"],
+                             capture_output=True, text=True)
+        pids = [p for p in out.stdout.split() if p.isdigit()]
+        return int(pids[0]) if pids else None
+
     try:
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", args.port),
-                                              Handler)
-    except OSError:
-        # already running — just bring the page back
-        print(f"swirl is already up → {url}")
-        if not args.no_open and sys.platform == "darwin":
-            subprocess.run(["open", url], capture_output=True)
-        return
+        srv = bind()
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            raise
+        # the port answering is not proof the page is current: a server
+        # never re-reads its file. Ask WHAT is holding the port.
+        try:
+            with urllib.request.urlopen(f"{url}/api/state", timeout=2) as r:
+                info = json.loads(r.read().decode())
+        except Exception:
+            info = None
+        pid = port_holder()
+        if not isinstance(info, dict) or "target" not in info:
+            cmd = ""
+            if pid:
+                ps = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                    capture_output=True, text=True)
+                cmd = ps.stdout.strip()
+            sys.exit(f"swirl: port {args.port} is held by something that "
+                     f"isn't swirl (pid {pid or '?'}: {cmd or 'unknown'}) "
+                     f"— free it or pick another --port")
+        if info.get("server_version") == SERVER_VERSION:
+            # same code — just bring the page back
+            print(f"swirl is already up → {url}")
+            if not args.no_open and sys.platform == "darwin":
+                subprocess.run(["open", url], capture_output=True)
+            return
+        # a swirl server on OLDER code: replace it so the page matches the
+        # disk. Fleets are detached processes reading disk — untouched.
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        srv = None
+        for _ in range(10):
+            time.sleep(0.2)
+            try:
+                srv = bind()
+                break
+            except OSError:
+                pass
+        if srv is None:
+            sys.exit(f"swirl: stale ui server (pid {pid or '?'}) did not "
+                     f"release port {args.port} — kill it and rerun")
+        print(f"→ replaced stale ui server (pid {pid or '?'}) — "
+              f"fleets unaffected")
     print(f"swirl ui → {url}   (Ctrl-C to quit; runs keep going without it)")
     if not args.no_open and sys.platform == "darwin":
         subprocess.run(["open", url], capture_output=True)
