@@ -306,12 +306,13 @@ class Runner:
     """Owns the fleet. One thread per agent, each looping ratchet cycles."""
 
     def __init__(self, target: Path, n_agents: int, max_cycles: int,
-                 oracle_cmd: str, task: str = None):
+                 oracle_cmd: str, task: str = None, model: str = None):
         self.target = target
         self.n = n_agents
         self.max_cycles = max_cycles
         self.oracle_cmd = oracle_cmd
         self.task = task
+        self.model = model
         self.fdir = farm_dir(target)
         self.claude_bin = resolve_claude()
         self.stop = threading.Event()
@@ -319,7 +320,7 @@ class Runner:
         self.procs = {}                        # agent_id -> Popen
         self.state = {
             "target": str(target), "oracle": oracle_cmd, "task": task,
-            "started": now_iso(), "n_agents": n_agents,
+            "model": model, "started": now_iso(), "n_agents": n_agents,
             "max_cycles": max_cycles, "done": False, "stopped": False,
             "problems_total": None, "oracle_history": [],
             "agents": {str(i): {"cycle": 0, "status": "starting",
@@ -406,6 +407,8 @@ class Runner:
         cmd = [self.claude_bin, "-p", prompt,
                "--output-format", "stream-json", "--verbose",
                "--dangerously-skip-permissions"]
+        if self.model:
+            cmd += ["--model", self.model]
         proc = subprocess.Popen(cmd, cwd=str(self.target),
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True)
@@ -638,9 +641,11 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
  .chip.stop{border-color:var(--red);color:var(--red)}
  label{display:block;color:var(--dim);font-size:10px;letter-spacing:.22em;
    margin:0 0 5px}
- input[type=text],textarea{width:100%;background:var(--well);color:var(--ink);
-   border:1px solid var(--line);padding:9px 10px;font:inherit;border-radius:0}
- input[type=text]:focus,textarea:focus{outline:none;border-color:var(--bright)}
+ input[type=text],textarea,select{width:100%;background:var(--well);
+   color:var(--ink);border:1px solid var(--line);padding:9px 10px;font:inherit;
+   border-radius:0}
+ input[type=text]:focus,textarea:focus,select:focus{outline:none;
+   border-color:var(--bright)}
  textarea{resize:none;min-height:72px;max-height:40vh;overflow-y:auto;
    display:block}
  .row{display:flex;gap:12px;margin:0 0 14px;align-items:flex-end}
@@ -687,6 +692,10 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <input type="text" id="path" placeholder="/path/to/project" spellcheck="false"></div>
  <div style="width:110px"><label>AGENTS</label>
   <input type="text" id="nag" value="20"></div>
+ <div style="width:130px"><label>MODEL</label>
+  <select id="model"><option value="">DEFAULT</option>
+   <option>haiku</option><option>sonnet</option><option>opus</option>
+   <option>fable</option></select></div>
 </div>
 <div class="row">
  <div class="grow"><label>ORDERS</label>
@@ -719,7 +728,8 @@ async function act(body){err('');
 function start(){const t=task.value.trim();
  if(!t){err('tell them what to do');return;}
  act({type:'start',path:document.getElementById('path').value,
- agents:document.getElementById('nag').value,task:t});}
+ agents:document.getElementById('nag').value,task:t,
+ model:document.getElementById('model').value});}
 function say(i,poke){const el=document.getElementById('in'+i); if(!el.value) return;
  act({type:poke?'poke':'say',agent:String(i),msg:el.value}); el.value='';}
 function card(i){return `<div class="card"><h3>AGENT ${i} <span id="st${i}"></span></h3>
@@ -741,6 +751,7 @@ async function tick(){
  const passes=ids.reduce((a,i)=>a+(ag[i].cycle||0),0);
  document.getElementById('summary').textContent=
    `${st.n_agents} agents · ${passes} passes`+
+   (st.model?` · model ${st.model}`:'')+
    (st.task?` · "${st.task.slice(0,90)}"`:'')+
    (now!=null&&first!=='?'?` · problems ${first} -> ${now}`:'')+
    ` · ${s.target}`;
@@ -818,6 +829,8 @@ def cmd_ui(args, self_path: str):
             cmd += ["run", task, str(p), "--no-wall"]
             if str(body.get("agents", "")).strip():
                 cmd += ["--agents", str(body["agents"]).strip()]
+            if str(body.get("model", "")).strip():
+                cmd += ["--model", str(body["model"]).strip()]
             out = subprocess.run(cmd, capture_output=True, text=True,
                                  cwd=str(Path(self_path).parent), timeout=300)
             holder["target"] = p.resolve()
@@ -973,6 +986,8 @@ def cmd_fix(args, self_path: str, task: str = None):
                else f"default {FLEET_DEFAULT}, bounded only by {files} files "
                     f"with problems (one file per agent per cycle)")
     print(f"→ fleet: {n} agents ({why})")
+    if args.model:
+        print(f"→ model: {args.model} (every agent, this run only)")
     if task:
         print(f"→ mode: GRIND — finish a pass, go again, go again; "
               f"cycles: {cyc}")
@@ -997,6 +1012,8 @@ def cmd_fix(args, self_path: str, task: str = None):
                   "--oracle-cmd", oracle_cmd]
     if task:
         runner_cmd += ["--task", task]
+    if args.model:
+        runner_cmd += ["--model", args.model]
     if args.fg:
         os.execv(sys.executable, runner_cmd)
     log = open(fdir / "runner.log", "a")
@@ -1064,6 +1081,10 @@ def main():
                        help="0 = forever (grind default); fix default 10")
         p.add_argument("--oracle", default=None,
                        help="shell cmd; stdout lines = problems")
+        p.add_argument("--model", default=None,
+                       help="claude model for every agent (alias like "
+                            "haiku/sonnet/opus/fable, or a full model "
+                            "name); unset = your claude default")
         p.add_argument("--fg", action="store_true",
                        help="run the runner in the foreground")
         p.add_argument("--no-wall", action="store_true")
@@ -1097,6 +1118,7 @@ def main():
     pr.add_argument("--max-cycles", type=int, required=True)
     pr.add_argument("--oracle-cmd", required=True)
     pr.add_argument("--task", default=None)
+    pr.add_argument("--model", default=None)
 
     args = ap.parse_args()
     if args.cmd == "fix":
@@ -1116,7 +1138,7 @@ def main():
         cmd_ui(args, self_path)
     elif args.cmd == "_runner":
         Runner(Path(args.target), args.agents, args.max_cycles,
-               args.oracle_cmd, task=args.task).run()
+               args.oracle_cmd, task=args.task, model=args.model).run()
 
 
 if __name__ == "__main__":
