@@ -30,6 +30,7 @@ FLEET_DEFAULT = 20      # throw agents at it, not thrift
 DEFAULT_MAX_CYCLES = 10
 SLICE_CAP = 15          # max problems handed to one agent per cycle
 POLL_SECS = 2.0         # poke-flag / state-flush cadence
+CLAIM_SWEEP_SECS = 900  # malformed (non-symlink) claims older than this die
 
 def slice_for(problems, agent_id: int, n_agents: int):
     """Partition problems by FILE (path prefix before the first ':'), then
@@ -159,10 +160,26 @@ def build_prompt(agent_id: int, n_agents: int, cycle: int, slice_lines,
             "finished — find the next most valuable concrete improvement "
             "and MAKE it this cycle. Real changes only.")
         parts.append(
-            f"Collision rule: {n_agents} agents work here concurrently. "
-            f"Sort the repo's source files alphabetically; prefer files "
-            f"whose index modulo {n_agents} equals {agent_id}. If another "
-            f"agent clearly just changed a file, pick a different one.")
+            f"Work-claiming protocol — {n_agents} agents work here "
+            "concurrently; divide the task, never duplicate it:\n"
+            f"1. Read what is already done: `tail -n 40 {FARM_DIRNAME}/worklog` "
+            "(one line per finished pass). Do NOT redo finished work.\n"
+            f"2. See what others hold right now: `ls -l {FARM_DIRNAME}/claims/` "
+            "(each symlink is <work-slug> -> agent-<n>).\n"
+            "3. Pick ONE unclaimed piece of the task and claim it BEFORE "
+            "touching any file:\n"
+            f"   `ln -s agent-{agent_id} {FARM_DIRNAME}/claims/<short-kebab-"
+            "slug>`\n"
+            "   If `ln` fails the piece is taken — pick a different one. "
+            "Claim another piece the same way only after finishing one.\n"
+            "4. This cycle, work ONLY on what you claimed. If the whole task "
+            "is claimed up, find a smaller unclaimed sub-piece; never idle, "
+            "never share a claim.\n"
+            "5. Before you stop, log your pass: `echo \"agent "
+            f"{agent_id} cycle {cycle}: <what you completed>\" >> "
+            f"{FARM_DIRNAME}/worklog`\n"
+            "Your claims are released automatically when your cycle ends. "
+            "Never delete another agent's claim.")
         if oracle_cmd:
             parts.append(f"Verification oracle: `{oracle_cmd}` "
                          "(stdout lines = remaining problems; keep it clean).")
@@ -343,6 +360,45 @@ class Runner:
             proc.wait()
             raw.close()
             self.procs.pop(i, None)
+            self.release_claims(i)
+
+    # ---- work claims (task mode): agents claim slugs via atomic symlinks
+    # in .swirl/claims/ (<slug> -> agent-<i>); the runner frees an agent's
+    # claims when its cycle process exits, so a dead session can't squat.
+
+    def release_claims(self, i: int):
+        cdir = self.fdir / "claims"
+        if not cdir.is_dir():
+            return
+        freed = []
+        for p in cdir.iterdir():
+            try:
+                if p.is_symlink() and os.readlink(str(p)) == f"agent-{i}":
+                    p.unlink()
+                    freed.append(p.name)
+            except OSError:
+                pass
+        if freed:
+            append_feed(self.fdir, i,
+                        f"claims released: {', '.join(sorted(freed))}")
+
+    def sweep_claims(self):
+        """Fallback: an agent that ignored the ln -s protocol (mkdir, plain
+        file) would squat forever — the runner can't attribute it. Age it out."""
+        cdir = self.fdir / "claims"
+        if not cdir.is_dir():
+            return
+        for p in cdir.iterdir():
+            try:
+                if p.is_symlink():
+                    continue
+                if time.time() - p.lstat().st_mtime > CLAIM_SWEEP_SECS:
+                    if p.is_dir():
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        p.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ---- poke watcher: interrupt = end cycle now (fresh cycle picks up msg)
 
@@ -354,8 +410,9 @@ class Runner:
                     proc = self.procs.get(i)
                     if proc and proc.poll() is None:
                         append_feed(self.fdir, i,
-                                    "⚡ poked — restarting cycle now")
+                                    ">> poked — restarting cycle now")
                         proc.terminate()
+            self.sweep_claims()
             with self.lock:
                 pass
             self.flush_state()
@@ -365,7 +422,7 @@ class Runner:
     # ---- entry
 
     def run(self):
-        for sub in ("agents", "inbox", "poke"):
+        for sub in ("agents", "inbox", "poke", "claims"):
             (self.fdir / sub).mkdir(parents=True, exist_ok=True)
         for i in range(self.n):
             (self.fdir / "agents" / str(i)).mkdir(exist_ok=True)
@@ -592,8 +649,18 @@ def cmd_ui(args, self_path: str):
             fp = fdir / "agents" / str(i) / "feed.log"
             if fp.exists():
                 feeds[str(i)] = "".join(fp.read_text().splitlines(True)[-45:])
+        claims = {}
+        cdir = fdir / "claims"
+        if cdir.is_dir():
+            for p in sorted(cdir.iterdir()):
+                try:
+                    claims[p.name] = (os.readlink(str(p))
+                                      if p.is_symlink() else "?")
+                except OSError:
+                    pass
         rep = fdir / "report.md"
         return {"target": str(t), "state": state, "feeds": feeds,
+                "claims": claims,
                 "report": rep.read_text() if rep.exists() else None}
 
     def api_action(body):
@@ -721,8 +788,9 @@ def cmd_fix(args, self_path: str, task: str = None):
     fdir = farm_dir(target)
     fdir.mkdir(exist_ok=True)
     # wipe per-run state, keep old reports
-    for sub in ("agents", "inbox", "poke"):
+    for sub in ("agents", "inbox", "poke", "claims"):
         shutil.rmtree(fdir / sub, ignore_errors=True)
+    (fdir / "worklog").unlink(missing_ok=True)
 
     runner_cmd = [sys.executable, self_path, "_runner",
                   "--target", str(target), "--agents", str(n),

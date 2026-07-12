@@ -32,9 +32,13 @@ going until you stop them.
 ## How it works
 
 Each agent loops: fresh headless Claude Code session → does a pass → session
-ends → a new one starts in its place, cold. Agents don't talk to each other;
-they coordinate through the files they change. Everything each agent does is
-written to `<target>/.swirl/` — live feeds, fleet state, a report. The
+ends → a new one starts in its place, cold. Agents divide the work instead
+of duplicating it: before touching anything, an agent claims its piece of the
+task — an atomic symlink in `<target>/.swirl/claims/` — and skips pieces
+other agents hold. When its pass ends the claims are released and the agent
+logs what it finished to `<target>/.swirl/worklog`, so the next cold session
+builds on it instead of redoing it. Everything each agent does is written to
+`<target>/.swirl/` — live feeds, fleet state, claims, worklog, a report. The
 browser page and the tmux wall are read-only views of those files.
 
 ## Requirements
