@@ -142,6 +142,17 @@ def acquire_farm(fdir: Path, target: Path):
     sys.exit("swirl: lost a launch race — try again")
 
 
+def retag_farm(fdir: Path, pid: int):
+    """Repoint farm.pid without ever letting a reader see it empty —
+    write_text would truncate in place, and an acquirer reading that
+    instant would judge the live lock stale. Write-then-replace keeps
+    every observation of the name either old pid or new pid. Per-writer
+    tmp name: launcher and runner retag concurrently at startup."""
+    tmp = fdir / f"farm.pid.{os.getpid()}"
+    tmp.write_text(str(pid))
+    tmp.replace(fdir / "farm.pid")
+
+
 def atomic_write_json(path: Path, obj):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(obj, indent=1))
@@ -476,7 +487,7 @@ class Runner:
             (self.fdir / "agents" / str(i)).mkdir(exist_ok=True)
             append_feed(self.fdir, i,
                         f"agent {i} ready · target {self.target}")
-        (self.fdir / "farm.pid").write_text(str(os.getpid()))
+        retag_farm(self.fdir, os.getpid())
         self.flush_state()
 
         def on_term(sig, frame):
@@ -934,7 +945,7 @@ def cmd_fix(args, self_path: str, task: str = None):
                             stdout=log, stderr=log)
     # the lock outlives the launcher: retag farm.pid from our pid to the
     # runner's before we exit (the runner rewrites the same value at startup)
-    (fdir / "farm.pid").write_text(str(proc.pid))
+    retag_farm(fdir, proc.pid)
     # remember the newest run so `swirl ui` / restarts auto-attach to it
     try:
         (Path(self_path).parent / ".last_target").write_text(str(target))
