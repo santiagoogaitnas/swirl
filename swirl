@@ -209,7 +209,7 @@ def render_event(ev: dict) -> str:
                 bt = blk.get("type")
                 if bt == "text" and blk.get("text", "").strip():
                     txt = " ".join(blk["text"].split())
-                    out.append("💬 " + (txt[:160] + "…" if len(txt) > 160 else txt))
+                    out.append("> " + (txt[:160] + "…" if len(txt) > 160 else txt))
                 elif bt == "tool_use":
                     inp = blk.get("input", {})
                     arg = (inp.get("file_path") or inp.get("command")
@@ -217,17 +217,17 @@ def render_event(ev: dict) -> str:
                     arg = str(arg)
                     if len(arg) > 100:
                         arg = arg[:100] + "…"
-                    out.append(f"⚙ {blk.get('name', '?')} {arg}")
+                    out.append(f"* {blk.get('name', '?')} {arg}")
             return "\n".join(out)
         if t == "user":
             for blk in ev.get("message", {}).get("content", []):
                 if isinstance(blk, dict) and blk.get("type") == "tool_result" \
                         and blk.get("is_error"):
                     body = str(blk.get("content", ""))[:120]
-                    return f"✗ tool error: {body}"
+                    return f"! tool error: {body}"
             return ""
         if t == "result":
-            return (f"■ cycle finished · turns={ev.get('num_turns', '?')} · "
+            return (f"-- cycle finished · turns={ev.get('num_turns', '?')} · "
                     f"{round(ev.get('duration_ms', 0) / 1000)}s")
     except Exception:
         pass
@@ -329,7 +329,7 @@ class Runner:
                         f"\n━━━ CYCLE {cycle} · {len(my_slice)} problems "
                         f"assigned · {now_iso()} ━━━")
             if msg:
-                append_feed(self.fdir, i, f"✉ operator: {msg}")
+                append_feed(self.fdir, i, f">> operator: {msg}")
             self.run_cycle(i, cycle, prompt, adir)
         self.set_agent(i, status="done" if not self.stop.is_set()
                        or self.state.get("done") else "stopped")
@@ -523,8 +523,8 @@ def cmd_status(target: Path, live: bool):
         prob = s.get("problems_total")
         hist = s.get("oracle_history", [])
         first = hist[0]["problems"] if hist else "?"
-        flag = ("✅ DONE — oracle clean" if s.get("done")
-                else ("⛔ stopped" if s.get("stopped") else "🜄 grinding"))
+        flag = ("DONE — oracle clean" if s.get("done")
+                else ("STOPPED" if s.get("stopped") else "GRINDING"))
         out.append(f"SWIRL {s.get('target', '')}")
         out.append(f"{flag} · problems {first} → {prob} · "
                    f"oracle `{s.get('oracle', '')}`")
@@ -554,68 +554,139 @@ def cmd_status(target: Path, live: bool):
 
 UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <title>swirl</title><style>
- body{background:#111;color:#ddd;font:14px -apple-system,sans-serif;margin:0;padding:20px}
- h1{font-size:18px;margin:0 0 12px} .muted{color:#888} .mono{font-family:ui-monospace,monospace}
- .bar{background:#222;border-radius:6px;height:14px;overflow:hidden;margin:8px 0}
- .bar div{background:#4a9;height:100%;transition:width .5s}
- .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
- input[type=text]{background:#1a1a1a;border:1px solid #333;color:#ddd;padding:7px;border-radius:6px;flex:1;min-width:120px}
- button{background:#2a4;border:0;color:#fff;padding:8px 14px;border-radius:6px;cursor:pointer}
- button.gray{background:#444} button.red{background:#a33} button.amber{background:#a80}
- .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(430px,1fr));gap:12px;margin-top:14px}
- .card{background:#191919;border:1px solid #2a2a2a;border-radius:8px;padding:12px}
- .card h3{margin:0 0 6px;font-size:14px}
- pre{background:#0c0c0c;border-radius:6px;padding:8px;height:190px;overflow-y:auto;font-size:11px;white-space:pre-wrap;margin:8px 0}
- .chip{padding:2px 10px;border-radius:10px;font-size:12px}
- .grind{background:#a80} .done{background:#2a4} .stop{background:#a33} .none{background:#444}
- #report{background:#152015;border:1px solid #2a4;border-radius:8px;padding:12px;margin-top:14px;white-space:pre-wrap;display:none}
+ :root{--bg:#060a07;--panel:#0b120c;--well:#04170b;--line:#1d3a26;
+   --ink:#a9e6b6;--dim:#4d7a58;--bright:#63f792;--amber:#e8b45a;--red:#e8685c}
+ *{box-sizing:border-box}
+ body{background:var(--bg);color:var(--ink);margin:0;padding:24px 22px;
+   font:13px/1.5 ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+ .top{display:flex;align-items:baseline;gap:14px}
+ h1{font-size:15px;margin:0;color:var(--bright);letter-spacing:.45em;
+   font-weight:600;text-shadow:0 0 9px rgba(99,247,146,.35)}
+ .lead{flex:1;border-bottom:1px dashed var(--line);transform:translateY(-4px)}
+ .sub{color:var(--dim);font-size:11px;letter-spacing:.18em;margin:4px 0 22px}
+ .chip{border:1px solid var(--dim);color:var(--dim);font-size:11px;
+   letter-spacing:.2em;padding:3px 10px;white-space:nowrap}
+ .chip.grind{border-color:var(--bright);color:var(--bright);
+   text-shadow:0 0 8px rgba(99,247,146,.4)}
+ .chip.done{border-color:var(--bright);color:var(--bright)}
+ .chip.stop{border-color:var(--red);color:var(--red)}
+ label{display:block;color:var(--dim);font-size:10px;letter-spacing:.22em;
+   margin:0 0 5px}
+ input[type=text],textarea{width:100%;background:var(--well);color:var(--ink);
+   border:1px solid var(--line);padding:9px 10px;font:inherit;border-radius:0}
+ input[type=text]:focus,textarea:focus{outline:none;border-color:var(--bright)}
+ textarea{resize:none;min-height:72px;max-height:40vh;overflow-y:auto;
+   display:block}
+ .row{display:flex;gap:12px;margin:0 0 14px;align-items:flex-end}
+ .grow{flex:1}
+ button{background:transparent;border:1px solid var(--bright);
+   color:var(--bright);padding:9px 20px;font:inherit;font-size:12px;
+   letter-spacing:.2em;cursor:pointer;border-radius:0}
+ button:hover{background:var(--bright);color:var(--bg)}
+ button.red{border-color:var(--red);color:var(--red)}
+ button.red:hover{background:var(--red);color:var(--bg)}
+ button.amber{border-color:var(--amber);color:var(--amber)}
+ button.amber:hover{background:var(--amber);color:var(--bg)}
+ button.dim{border-color:var(--dim);color:var(--dim)}
+ button.dim:hover{background:var(--dim);color:var(--bg)}
+ .hint{color:var(--dim);font-size:11px;margin:6px 0 0}
+ #err{color:var(--red);font-size:12px}
+ .section{color:var(--dim);font-size:10px;letter-spacing:.22em;
+   margin:26px 0 10px;display:flex;align-items:center;gap:10px}
+ .section:after{content:"";flex:1;border-bottom:1px dashed var(--line)}
+ #summary{font-size:12px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(430px,1fr));
+   gap:14px;margin-top:12px}
+ .card{background:var(--panel);border:1px solid var(--line);padding:12px}
+ .card h3{margin:0 0 4px;font-size:12px;color:var(--bright);font-weight:600;
+   letter-spacing:.12em}
+ .card h3 span{color:var(--dim);letter-spacing:0;font-weight:400}
+ .holds{color:var(--amber);font-size:11px;min-height:17px;margin:0 0 6px}
+ pre{background:var(--well);border:1px solid var(--line);padding:9px;
+   height:210px;overflow-y:auto;font-size:11px;line-height:1.55;
+   white-space:pre-wrap;word-break:break-word;margin:0 0 10px;color:#7fc08e}
+ .sayrow{display:flex;gap:8px}
+ .sayrow input{flex:1}
+ .sayrow button{padding:7px 12px;font-size:11px}
+ #report{border:1px solid var(--bright);background:var(--panel);padding:13px;
+   margin-top:18px;white-space:pre-wrap;display:none}
+ .foot{color:var(--dim);font-size:11px;margin-top:26px;
+   border-top:1px dashed var(--line);padding-top:10px}
 </style></head><body>
-<h1>🌀 swirl <span id="chip" class="chip none">no run</span></h1>
+<div class="top"><h1>*SWIRL*</h1><div class="lead"></div>
+ <span id="chip" class="chip">NO RUN</span></div>
+<div class="sub">PARALLEL CLAUDE AGENTS · FINISH A PASS · RESET COLD · GO AGAIN</div>
 <div class="row">
- <input type="text" id="path" placeholder="folder — /path/to/project">
- <input type="text" id="nag" value="20" style="max-width:110px" title="how many agents">
+ <div class="grow"><label>TARGET FOLDER</label>
+  <input type="text" id="path" placeholder="/path/to/project" spellcheck="false"></div>
+ <div style="width:110px"><label>AGENTS</label>
+  <input type="text" id="nag" value="20"></div>
 </div>
 <div class="row">
- <input type="text" id="task" placeholder="what should they do — they'll do it, reset, and do it again, forever, until you stop them">
+ <div class="grow"><label>ORDERS</label>
+  <textarea id="task" spellcheck="false" placeholder="what should they do — they'll do it, reset, and do it again, forever, until you stop them"></textarea>
+  <div class="hint">enter = launch · shift+enter = newline</div>
+ </div>
+</div>
+<div class="row" style="align-items:center">
  <button onclick="start()">LAUNCH</button>
- <button class="red" onclick="act({type:'stop'})">Stop</button>
+ <button class="red" onclick="act({type:'stop'})">STOP</button>
+ <span id="err"></span>
 </div>
-<div id="summary" class="muted">Nothing swirling. Fill the three boxes, hit LAUNCH.</div>
+<div class="section">FLEET</div>
+<div id="summary" class="hint">nothing swirling — set target and orders, hit LAUNCH.</div>
 <div id="agents" class="grid"></div>
-<div id="report" class="mono"></div>
+<div id="report"></div>
+<div class="foot" id="foot">this page is a read-only view of the target's .swirl/ — feeds, state.json, claims/, worklog live there</div>
 <script>
-let T=null;
-async function act(body){const r=await fetch('/api/action',{method:'POST',body:JSON.stringify(body)});
- const j=await r.json(); if(j.output) console.log(j.output); if(j.error) alert(j.error); tick();}
-function start(){const t=document.getElementById('task').value.trim();
- if(!t){alert('tell them what to do');return;}
+const task=document.getElementById('task');
+function grow(){task.style.height='auto';
+ task.style.height=Math.min(task.scrollHeight,innerHeight*.4)+'px';}
+task.addEventListener('input',grow);
+task.addEventListener('keydown',e=>{
+ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();start();}});
+function err(m){document.getElementById('err').textContent=m||'';}
+async function act(body){err('');
+ const r=await fetch('/api/action',{method:'POST',body:JSON.stringify(body)});
+ const j=await r.json(); if(j.output) console.log(j.output);
+ if(j.error) err(j.error); tick();}
+function start(){const t=task.value.trim();
+ if(!t){err('tell them what to do');return;}
  act({type:'start',path:document.getElementById('path').value,
  agents:document.getElementById('nag').value,task:t});}
 function say(i,poke){const el=document.getElementById('in'+i); if(!el.value) return;
  act({type:poke?'poke':'say',agent:String(i),msg:el.value}); el.value='';}
-function card(i){return `<div class="card"><h3>agent ${i} <span id="st${i}" class="muted"></span></h3>
- <pre id="feed${i}"></pre><div class="row"><input type="text" id="in${i}" placeholder="tell agent ${i} something…">
- <button onclick="say(${i},false)">Say</button><button class="amber" onclick="say(${i},true)">Poke</button></div></div>`;}
+function card(i){return `<div class="card"><h3>AGENT ${i} <span id="st${i}"></span></h3>
+ <div class="holds" id="h${i}"></div><pre id="feed${i}"></pre>
+ <div class="sayrow"><input type="text" id="in${i}" placeholder="tell agent ${i} something…" spellcheck="false">
+ <button class="dim" onclick="say(${i},false)">SAY</button>
+ <button class="amber" onclick="say(${i},true)">POKE</button></div></div>`;}
 async function tick(){
  const s=await (await fetch('/api/state')).json();
  const chip=document.getElementById('chip');
- if(!s.target){chip.textContent='no run';chip.className='chip none';return;}
+ if(!s.target){chip.textContent='NO RUN';chip.className='chip';return;}
+ document.getElementById('foot').textContent=
+   `this page is a read-only view of ${s.target}/.swirl/ — feeds, state.json, claims/, worklog live there`;
  const st=s.state||{}; const hist=st.oracle_history||[];
  const first=hist.length?hist[0].problems:'?'; const now=st.problems_total;
- const status=st.done?['done ✅','done']:(st.stopped?['stopped','stop']:['swirling','grind']);
- chip.textContent=status[0]; chip.className='chip '+status[1];
+ const status=st.done?['DONE','chip done']:(st.stopped?['STOPPED','chip stop']:['GRINDING','chip grind']);
+ chip.textContent=status[0]; chip.className=status[1];
  const ag=st.agents||{}; const ids=Object.keys(ag).sort((a,b)=>a-b);
  const passes=ids.reduce((a,i)=>a+(ag[i].cycle||0),0);
  document.getElementById('summary').textContent=
-   `${st.n_agents} agents · ${passes} passes so far`+
-   (st.task?` · "${st.task.slice(0,80)}"`:'')+
-   (now!=null&&first!=='?'?` · problems ${first} → ${now}`:'')+
+   `${st.n_agents} agents · ${passes} passes`+
+   (st.task?` · "${st.task.slice(0,90)}"`:'')+
+   (now!=null&&first!=='?'?` · problems ${first} -> ${now}`:'')+
    ` · ${s.target}`;
  const box=document.getElementById('agents');
  if(box.dataset.sig!==ids.join()+s.target){box.dataset.sig=ids.join()+s.target;
    box.innerHTML=ids.map(card).join('');}
+ const held={};
+ for(const [slug,who] of Object.entries(s.claims||{})){
+   if(who.startsWith('agent-'))(held[who.slice(6)]=held[who.slice(6)]||[]).push(slug);}
  for(const i of ids){const a=ag[i];
    document.getElementById('st'+i).textContent=`· cycle ${a.cycle} · ${a.status}`;
+   document.getElementById('h'+i).textContent=held[i]?'holds: '+held[i].join(', '):'';
    const f=document.getElementById('feed'+i); const txt=(s.feeds&&s.feeds[i])||'';
    if(f.textContent!==txt){f.textContent=txt; f.scrollTop=f.scrollHeight;}}
  const rep=document.getElementById('report');
@@ -668,7 +739,10 @@ def cmd_ui(args, self_path: str):
         if kind == "start":
             cmd = [sys.executable, self_path]
             task = str(body.get("task", "")).strip()
-            p = Path(body.get("path", "")).expanduser()
+            raw_path = str(body.get("path", "")).strip()
+            if not raw_path:
+                return {"error": "give them a folder"}
+            p = Path(raw_path).expanduser()
             if not p.is_dir():
                 return {"error": f"not a directory: {p}"}
             if not task:
@@ -828,7 +902,7 @@ def cmd_say(target: Path, agent: str, msg: str, poke: bool):
             (fdir / "poke").mkdir(exist_ok=True)
             (fdir / "poke" / str(i)).write_text("1")
     verb = "poked" if poke else "queued for next cycle"
-    print(f"✉ {verb}: agent {agent}")
+    print(f"{verb}: agent {agent}")
 
 
 def cmd_stop(target: Path):
