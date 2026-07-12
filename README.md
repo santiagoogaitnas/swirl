@@ -11,7 +11,8 @@ finishes a pass, resets, and goes again — until you stop it.
 ```
 
 Opens a browser page with three boxes: **folder · how many agents · what
-they should do**. Hit **LAUNCH**. One live card appears per agent; type into
+they should do** — plus a **MODEL** pick (no pick = whatever your `claude`
+defaults to). Hit **LAUNCH**. One live card appears per agent; type into
 a card to steer that agent (**Say** = next pass, **Poke** = interrupt now).
 **Stop** ends everything. Closing the page changes nothing — agents keep
 going until you stop them.
@@ -20,6 +21,7 @@ going until you stop them.
 
 ```bash
 ./swirl run "instruction" /path/to/project --agents 20   # launch
+./swirl run "instruction" /path/to/project --model opus  # every agent on opus, this run only
 ./swirl watch --target /path/to/project                  # tmux wall (one pane per agent)
 ./swirl status --live --target /path/to/project          # fleet table
 ./swirl say 3 "message" --target /path/to/project        # lands at agent 3's next pass
